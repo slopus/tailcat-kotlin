@@ -111,6 +111,12 @@ accepts the same arguments. The Android instrumentation runner executes the real
 library with supplied relay/echo arguments. See [Architecture](Documentation/Architecture.md)
 and [Verification](Documentation/Verification.md) for exact executed targets and results.
 
+Independent Go peers exercised JVM, Linux x64 Native and Android API 36 client
+and server runtimes. The Android client also completed TCP/UDP transfers through
+a public DERP with normal SDK certificate verification. Device checks used a
+relay reached through standard ADB TCP forwarding; direct Android UDP and NAT
+traversal remain outside the executed coverage.
+
 Protocol reference: [tailscale/tailcat](https://github.com/tailscale/tailcat) commit
 `52fbad323e9d352f1febb623e0975368e9a8cbdd`, with behavior cross-checked against the
 native Swift port at `b40c9b4`. Protocol fixtures and upstream Go peers are test

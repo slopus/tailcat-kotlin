@@ -66,6 +66,7 @@ evidence that its network path executed.
 | Go client to Native forwarding server | Both destination families: 64 KiB TCP, FIN/EOF and UDP cases passed |
 | Android API 36 ART client to Go | 16 KiB TCP echo, FIN/EOF and UDP 0, 1, 31 and 1,232 bytes passed through DERP |
 | Go client to Android API 36 ART server | 16 KiB exact TCP echo, FIN/EOF and UDP 0, 1, 31 and 1,232 bytes passed through DERP |
+| Android API 36 ART client through public verified DERP TLS | 1 KiB TCP echo, FIN/EOF and UDP 0, 1, 31 and 1,232 bytes passed with normal SDK certificate validation |
 
 Go also exercised four concurrent 256 KiB TCP connections and eight concurrent
 1,232-byte UDP exchanges against the JVM and Linux x64 Native servers. Malformed meow
@@ -110,9 +111,23 @@ including cached immutable key derivation, also passed the independent Go client
 16 KiB exact TCP echo with FIN/EOF and all four UDP payload sizes. Both directions
 used standard, non-root ADB TCP forwarding to the relay. This establishes actual
 Android ART client and server execution and encrypted tunnel TCP/UDP over DERP.
-Android direct UDP, NAT traversal, verified TLS and older API levels remain
-outside the completed device coverage. The instrumentation APK was assembled;
-PackageManager instrumentation was not used.
+
+The final Android Kotlin client also passed against the independent Go peer
+through public DERP `tc302a.ipn.dev`: 1 KiB exact TCP echo with FIN/EOF and UDP
+payloads of 0, 1, 31 and 1,232 bytes. Both TLS certificate chain and hostname
+validation remained enabled, with `InsecureForTests` false and the plaintext
+fixture option disabled. The node's explicit dial address was `127.0.0.1:44543`;
+standard ADB reverse forwarding reached a host TCP passthrough to the public
+DERP's port 443. HostName, SNI and certificate identity remained
+`tc302a.ipn.dev`, and TLS terminated at the public DERP. A separate SDK-only
+probe independently completed verified TLS 1.3 and the HTTP 101 DERP upgrade
+over this route. The full Kotlin runner reported `PASS` after all TCP and UDP
+assertions, with connection path `Relay`.
+
+These device checks establish Android relay interoperability and verified SDK
+TLS. Android direct UDP, NAT traversal and older API levels remain outside the
+executed coverage. The instrumentation APK was assembled; PackageManager
+instrumentation was not used.
 
 No iOS, macOS or Windows target is claimed by this port. Linux OpenSSL and glibc
 requirements apply to Native consumers. This is a userspace IPv6 stack with a
