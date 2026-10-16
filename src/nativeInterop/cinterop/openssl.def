@@ -1,0 +1,30 @@
+package = io.tailcat.openssl
+linkerOpts = -l:libssl.so.3 -l:libcrypto.so.3
+---
+#include <stddef.h>
+typedef struct ssl_st SSL;
+typedef struct ssl_ctx_st SSL_CTX;
+typedef struct ssl_method_st SSL_METHOD;
+typedef struct X509_VERIFY_PARAM_st X509_VERIFY_PARAM;
+const SSL_METHOD *TLS_client_method(void);
+SSL_CTX *SSL_CTX_new(const SSL_METHOD *method);
+void SSL_CTX_free(SSL_CTX *ctx);
+int SSL_CTX_set_default_verify_paths(SSL_CTX *ctx);
+void SSL_CTX_set_verify(SSL_CTX *ctx, int mode, void *callback);
+long SSL_CTX_ctrl(SSL_CTX *ctx, int command, long arg, void *pointer);
+SSL *SSL_new(SSL_CTX *ctx);
+void SSL_free(SSL *ssl);
+int SSL_set_fd(SSL *ssl, int fd);
+long SSL_ctrl(SSL *ssl, int command, long arg, void *pointer);
+X509_VERIFY_PARAM *SSL_get0_param(SSL *ssl);
+int X509_VERIFY_PARAM_set1_host(X509_VERIFY_PARAM *param, const char *name, size_t length);
+int X509_VERIFY_PARAM_set1_ip_asc(X509_VERIFY_PARAM *param, const char *ip);
+void X509_VERIFY_PARAM_set_hostflags(X509_VERIFY_PARAM *param, unsigned int flags);
+int SSL_connect(SSL *ssl);
+int SSL_read(SSL *ssl, void *buffer, int count);
+int SSL_write(SSL *ssl, const void *buffer, int count);
+int SSL_get_error(const SSL *ssl, int result);
+long SSL_get_verify_result(const SSL *ssl);
+void ERR_clear_error(void);
+unsigned long ERR_get_error(void);
+void ERR_error_string_n(unsigned long error, char *buffer, size_t count);

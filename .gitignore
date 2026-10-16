@@ -1,0 +1,6 @@
+.context/
+.gradle/
+.kotlin/
+**/build/
+local.properties
+*.hprof
