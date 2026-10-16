@@ -73,3 +73,29 @@ library is the only runtime package dependency. OpenSSL, POSIX and Java/Android 
 facilities are platform dependencies. Test libraries, Gradle plugins, upstream Go
 fixtures and build tools are excluded from runtime artifacts. Standalone examples
 resolve the published coordinates to check that boundary.
+The standalone examples accept `-PtailcatRepository=/path/to/repository` to use
+a separate local Maven repository instead of the default Maven local location.
+
+## Resource limits
+
+Queue limits include 256 raw network packets, 512 engine events, 256 DERP sends,
+128 pending accepts and 128 datagrams per UDP flow. Servers admit at most 1,024
+identities, 128 pending tunnel authentications and 128 concurrent admission hooks.
+Pending identities expire after 30 seconds and rotate when full; authenticated
+inactive peers expire after five minutes. TCP has at most 1,024 states per stack,
+a 64 KiB receive window and a 4 MiB write queue per connection. Forwarding has
+at most 128 destination stacks and 256 automatic service listeners.
+
+## Native linking
+
+Linux Native consumers link against OpenSSL 3 installed for their target. Set
+`-Ptailcat.opensslLibDir=/path/to/libraries` for the executable examples when it
+differs from `/usr/lib/x86_64-linux-gnu`. The checked Linux executable uses the
+host OpenSSL and inherits its glibc requirement; it is not a portable static
+binary. `--allow-shlib-undefined` accommodates the Kotlin compiler's older
+link-time sysroot while the host loader resolves the system libraries. Choose
+OpenSSL and a matching sysroot for the oldest distribution you support.
+
+The upstream `InsecureForTests` node flag skips TLS certificate checks while
+keeping TLS enabled. `testOnlyPlaintextDERP` separately enables local HTTP
+fixtures and is restricted to loopback and the Android emulator host alias.
