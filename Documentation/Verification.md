@@ -65,6 +65,7 @@ evidence that its network path executed.
 | Native client to Go forwarding server | Both IPv4 `198.51.100.7:8080` via NAT64 and IPv6 `[2001:db8::7]:8080`: 64 KiB TCP, FIN/EOF and UDP cases passed |
 | Go client to Native forwarding server | Both destination families: 64 KiB TCP, FIN/EOF and UDP cases passed |
 | Android API 36 ART client to Go | 16 KiB TCP echo, FIN/EOF and UDP 0, 1, 31 and 1,232 bytes passed through DERP |
+| Go client to Android API 36 ART server | 16 KiB exact TCP echo, FIN/EOF and UDP 0, 1, 31 and 1,232 bytes passed through DERP |
 
 Go also exercised four concurrent 256 KiB TCP connections and eight concurrent
 1,232-byte UDP exchanges against the JVM and Linux x64 Native servers. Malformed meow
@@ -104,10 +105,14 @@ on a Google APIs x86-64 API 36 software emulator. Its system services had not
 finished enabling ordinary guest networking, so standard ADB TCP forwarding made
 the host relay reachable on emulator loopback. A separate SDK socket probe first
 confirmed the DERP HTTP upgrade. The full Kotlin client then passed against the
-independent Go peer using `plain timeout=180000`. This establishes actual Android
-ART execution and encrypted tunnel TCP/UDP over the relay. Android direct UDP,
-NAT traversal and older API levels remain outside the executed coverage. The
-instrumentation APK was assembled; PackageManager instrumentation was not used.
+independent Go peer using `plain timeout=180000`. The final Android server runner,
+including cached immutable key derivation, also passed the independent Go client:
+16 KiB exact TCP echo with FIN/EOF and all four UDP payload sizes. Both directions
+used standard, non-root ADB TCP forwarding to the relay. This establishes actual
+Android ART client and server execution and encrypted tunnel TCP/UDP over DERP.
+Android direct UDP, NAT traversal, verified TLS and older API levels remain
+outside the completed device coverage. The instrumentation APK was assembled;
+PackageManager instrumentation was not used.
 
 No iOS, macOS or Windows target is claimed by this port. Linux OpenSSL and glibc
 requirements apply to Native consumers. This is a userspace IPv6 stack with a
