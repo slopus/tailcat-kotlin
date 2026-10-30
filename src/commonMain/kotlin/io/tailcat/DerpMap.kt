@@ -20,10 +20,11 @@ class MemoryDERPMapCache : DERPMapCache {
 
 /** DERP map loading and expansion, with a one-hour cache and stale fallback. */
 class DERPMapProvider(
-    private val url: String = "https://controlplane.tailscale.com/derpmap/default",
+    val url: String = defaultURL,
     private val cache: DERPMapCache = MemoryDERPMapCache(),
 ) {
-    fun regions(cancelled: () -> Boolean = { false }): List<DERPRegion> {
+    /** Failed fetches use the cached map, even when stale; without one they throw. */
+    fun regions(cancelled: () -> Boolean = { false }, forServer: Boolean = false): List<DERPRegion> {
         if (cancelled()) throw TailcatClosedException()
         val previous = cache.load()
         val now = io.tailcat.platform.wallClockMillis()
@@ -31,15 +32,15 @@ class DERPMapProvider(
             try { return parse(previous.json) } catch (_: Exception) { }
         }
         return try {
-            val response = httpsGet(url, previous?.etag,cancelled)
+            val response = httpsGet(url, previous?.etag, if (forServer) "server" else "client", cancelled)
             val entry = if (response.status == 304 && previous != null) previous.copy(fetchedAtMillis = now)
                 else { require(response.status == 200); DERPMapCacheEntry(response.body.decodeToString(throwOnInvalidSequence = true), response.headers["etag"] ?: "", now) }
             val parsed = parse(entry.json)
             require(parsed.isNotEmpty())
             cache.store(entry); parsed
-        } catch (_: Exception) {
+        } catch (failure: Exception) {
             if (cancelled()) throw TailcatClosedException()
-            previous?.let { try { parse(it.json) } catch (_: Exception) { null } } ?: builtInRegions
+            previous?.let { try { parse(it.json) } catch (_: Exception) { null } } ?: throw failure
         }
     }
     fun expand(address: TailcatAddress, cancelled: () -> Boolean = { false }): List<DERPRegion> = if (address.regions.isNotEmpty()) address.regions
@@ -74,11 +75,7 @@ class DERPMapProvider(
     }
 
     companion object {
-        val builtInRegions: List<DERPRegion> = listOf(
-            DERPRegion(1, listOf(DERPNode("derp1.tailscale.com", regionID = 1)), "nyc", "New York"),
-            DERPRegion(2, listOf(DERPNode("derp2.tailscale.com", regionID = 2)), "sfo", "San Francisco"),
-            DERPRegion(4, listOf(DERPNode("derp4.tailscale.com", regionID = 4)), "fra", "Frankfurt"),
-        )
+        const val defaultURL = "https://tailcat.dev/derpmap.json"
         fun parse(json: String): List<DERPRegion> {
             val root = Json.parse(json) as? Map<*, *> ?: error("Invalid DERP map")
             val regions = root["Regions"] as? Map<*, *> ?: error("Missing DERP regions")
@@ -101,7 +98,7 @@ class DERPMapProvider(
 }
 
 private data class HttpResponse(val status: Int, val headers: Map<String, String>, val body: ByteArray)
-private fun httpsGet(url: String, etag: String?, cancelled: () -> Boolean): HttpResponse {
+private fun httpsGet(url: String, etag: String?, mode: String, cancelled: () -> Boolean): HttpResponse {
     require(url.startsWith("https://")) { "DERP map URL requires HTTPS" }
     val remainder = url.substring(8)
     val authority = remainder.substringBefore('/'); val path = "/" + remainder.substringAfter('/', "")
@@ -111,7 +108,7 @@ private fun httpsGet(url: String, etag: String?, cancelled: () -> Boolean): Http
     return streamDeadline(stream,15000,cancelled) { try {
         stream.connect(host, port, true)
         val conditional = if (!etag.isNullOrEmpty() && etag.none { it == '\r' || it == '\n' }) "If-None-Match: $etag\r\n" else ""
-        stream.write("GET $path HTTP/1.1\r\nHost: $authority\r\nAccept: application/json\r\nConnection: close\r\n$conditional\r\n".encodeToByteArray())
+        stream.write("GET $path HTTP/1.1\r\nHost: $authority\r\nAccept: application/json\r\nTailcat-Mode: $mode\r\nConnection: close\r\n$conditional\r\n".encodeToByteArray())
         fun line(): String {
             val output = ArrayList<Byte>(); val one = ByteArray(1)
             while (true) {

@@ -48,7 +48,7 @@ class TailcatServer(private val configuration: ServerConfiguration = ServerConfi
             val identity = configuration.privateKey ?: NodePrivateKey.generate()
             val psk = if (configuration.disablePresharedKey) null else configuration.presharedKey?.takeUnless { it.isZero } ?: PresharedKey.generate()
             val cancelled = { lock.withLock { closed } }
-            val region = configuration.region ?: configuration.mapProvider.regions(cancelled).let { regions ->
+            val region = configuration.region ?: configuration.mapProvider.regions(cancelled, forServer = true).let { regions ->
                 if (configuration.regionID > 0) regions.firstOrNull { it.regionID == configuration.regionID } ?: error("Unknown DERP region")
                 else configuration.mapProvider.select(regions,cancelled)
             }

@@ -205,8 +205,11 @@ streams with half-close propagation.
 DERP provides the initial route and stays available when direct UDP cannot
 connect. `client.path` and `server.path(key)` report the current route. Local
 interface changes refresh discovery; call `resetNetworkPaths()` after a known
-network change. Custom regions and cached DERP maps are configurable before
-startup. Production TLS verifies the certificate chain and hostname by default.
+network change. Relay regions come from Tailcat's DERP map,
+`https://tailcat.dev/derpmap.json`, cached for an hour and revalidated with its
+ETag; a failed refresh uses the cached map. Pass a `DERPMapProvider` with another
+URL or cache, or a fixed `region`, to override it. Production TLS verifies the
+certificate chain and hostname by default.
 
 ## Android and Native integration
 

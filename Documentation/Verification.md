@@ -46,6 +46,7 @@ TAILCAT_PLATFORM_TLS_HOST=tc302a.ipn.dev
 TAILCAT_PLATFORM_TLS_PORT=443
 TAILCAT_PLATFORM_SELF_TLS_HOST=127.0.0.1
 TAILCAT_PLATFORM_SELF_TLS_PORT=40623
+TAILCAT_LIVE_DERP_MAP=1  # fetch https://tailcat.dev/derpmap.json
 ```
 
 Run the suite with `./gradlew jvmTest linuxX64Test`. Each target executes 32 test

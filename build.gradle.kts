@@ -60,7 +60,7 @@ tasks.register<JavaExec>("runJvmCheck") {
 // Fixture configuration changes must invalidate test results, even with unchanged code.
 tasks.withType<org.gradle.api.tasks.testing.AbstractTestTask>().configureEach {
     listOf("TAILCAT_LOCAL_RELAY_PORT", "TAILCAT_PLATFORM_TLS_HOST", "TAILCAT_PLATFORM_TLS_PORT",
-        "TAILCAT_PLATFORM_SELF_TLS_HOST", "TAILCAT_PLATFORM_SELF_TLS_PORT").forEach { name ->
+        "TAILCAT_PLATFORM_SELF_TLS_HOST", "TAILCAT_PLATFORM_SELF_TLS_PORT", "TAILCAT_LIVE_DERP_MAP").forEach { name ->
         inputs.property(name, providers.environmentVariable(name).orElse(""))
     }
 }
