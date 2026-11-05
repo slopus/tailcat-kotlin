@@ -58,6 +58,59 @@ DERP-map HTTP reads have a watchdog deadline, and map loading observes server
 shutdown or the client's overall connection deadline. STUN resolution runs after
 relay startup and cannot hold the public startup operation.
 
+With `relayFirst`, UDP binding and interface enumeration also run after DERP is
+ready, on one coalescing discovery worker outside the transport lock. Direct
+discovery is enabled per peer only after WireGuard establishment. Socket events,
+bind results and DNS results carry or check a network generation; reset/close
+invalidates stale completions. A voluntary direct retry keeps its existing route.
+Opening the authentication gate immediately schedules the first bounded invitation
+and probe. An empty candidate set does not consume the one-second real-probe
+interval; the next authenticated candidate can be challenged immediately. Repeated
+authentication callbacks do not reset rate limits, and direct traffic still
+requires a matching fresh Pong.
+
+Independent clients never share node/discovery identities, WireGuard sessions,
+UDP sockets, or DERP connections. JVM/Android share the platform TLS factory, not
+transport connections. On verified TLS 1.3 connections, the presented certificate
+message may include upstream DERP's metadata certificate: an exact
+`CN=derpkey<64 hex digits>` subject and a nonzero one-byte protocol version in its
+serial number. Its public key is a capability carried by that authenticated TLS
+connection, not a trust anchor or a cached peer key. `Derp-Fast-Start: 1` lets the
+client write its fresh encrypted ClientInfo with the HTTP request, removing the
+wait for HTTP 101 and ServerKey before sending ClientInfo. The subsequent greeting
+must match the metadata, and authenticated ServerInfo remains mandatory before
+any queued meow, WireGuard, reset, or application packet can be written.
+TLS resumption remains platform-controlled. If a resumed TLS session exposes
+older metadata after relay-key rotation, the greeting comparison rejects it and
+the next fresh socket uses ordinary DERP registration; no application-level
+relay-key cache is maintained.
+
+Missing/malformed metadata, TLS before 1.3, insecure test TLS, and Linux Native use
+ordinary HTTP upgrade. A failed advertised fast start closes that socket and
+disables fast start for that transport; the existing bounded reconnect path uses
+a fresh socket with normal TLS and DERP authentication. No WireGuard session keys, nonces,
+route validation, or relay connection are reused between clients. Empty-probe
+scheduling and fast start do not change the meaning of `relayFirst`.
+
+A local network reset, selected-path send failure or expired direct lease requests
+one encrypted empty WireGuard transport packet on DERP. The engine prepares it
+under its own crypto ownership, outside the network lock; it never supplies a
+callback invoked while that lock is held. A per-peer token rejects obsolete
+preparations. DERP's bounded, per-peer priority slot sends the marker before that
+peer's queued application data. Other peers, discovery and rekey handshakes remain
+eligible while marker preparation is pending. Missing keys release the barrier
+so normal rekey can proceed; close and peer removal release it too.
+
+The receiver handles only successfully authenticated empty transport packets on
+an already established peer, excluding initial counter-zero confirmations. A
+bounded three-index marker-counter history rejects older markers without treating
+newer application packets as a reason to ignore a delayed reset hint. The marker
+invalidates old path probes and schedules fresh validation, but does not trigger a
+reflexive outgoing marker. Ordinary relayed application packets do not change the
+route, preventing oscillation during asymmetric direct-path promotion. This uses
+the existing WireGuard keepalive encoding; older peers still accept it but may not
+recover their return path as promptly.
+
 The Native stream serializes individual OpenSSL calls while polling outside that
 lock, permitting simultaneous read and write. Active-operation counts defer file
 descriptor and SSL object release until operations have observed shutdown. SIGPIPE
@@ -78,7 +131,8 @@ a separate local Maven repository instead of the default Maven local location.
 
 ## Resource limits
 
-Queue limits include 256 raw network packets, 512 engine events, 256 DERP sends,
+Queue limits include 256 raw network packets, 512 engine events, 256 DERP sends
+plus at most one priority reset marker for each of 1,024 peers,
 128 pending accepts and 128 datagrams per UDP flow. Servers admit at most 1,024
 identities, 128 pending tunnel authentications and 128 concurrent admission hooks.
 Pending identities expire after 30 seconds and rotate when full; authenticated

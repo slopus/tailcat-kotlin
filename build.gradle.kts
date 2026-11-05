@@ -57,6 +57,16 @@ tasks.register<JavaExec>("runJvmCheck") {
     providers.gradleProperty("checkArgs").orNull?.let { args(it.split(' ')) }
 }
 
+tasks.register<Jar>("benchmarkJar") {
+    dependsOn("jvmMainClasses")
+    archiveFileName.set("tailcat-benchmark.jar")
+    duplicatesStrategy = DuplicatesStrategy.EXCLUDE
+    manifest.attributes["Main-Class"] = "io.tailcat.benchmark.TailcatBenchmark"
+    from(kotlin.targets.getByName("jvm").compilations.getByName("main").output.allOutputs)
+    from({ configurations.getByName("jvmRuntimeClasspath").map { if (it.isDirectory) it else zipTree(it) } })
+    exclude("META-INF/*.SF", "META-INF/*.RSA", "META-INF/*.DSA")
+}
+
 // Fixture configuration changes must invalidate test results, even with unchanged code.
 tasks.withType<org.gradle.api.tasks.testing.AbstractTestTask>().configureEach {
     listOf("TAILCAT_LOCAL_RELAY_PORT", "TAILCAT_PLATFORM_TLS_HOST", "TAILCAT_PLATFORM_TLS_PORT",

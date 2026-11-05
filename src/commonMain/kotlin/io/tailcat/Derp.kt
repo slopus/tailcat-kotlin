@@ -1,6 +1,5 @@
 package io.tailcat
 
-import io.tailcat.crypto.NaClBox
 import io.tailcat.platform.*
 
 internal data class DerpPacket(val source: NodePublicKey, val payload: ByteArray)
@@ -17,8 +16,9 @@ internal class DerpTransport(
     nodes: List<DERPNode>,
     private val privateKey: NodePrivateKey,
     private val testOnlyPlaintext: Boolean = false,
+    private val trace: StartupTrace? = null,
     private val incoming: (DerpPacket) -> Unit,
-) {
+) : NetworkRelay {
     private val nodes = nodes.filter { !it.stunOnly }
     private val lock = PlatformLock()
     private val writes = PlatformLock()
@@ -35,11 +35,17 @@ internal class DerpTransport(
     private var tokens = 0.0
     private var tokenAt = monotonicMillis()
     private val queue = ArrayDeque<DerpFrame>()
+    private val resetMarkers = linkedMapOf<NodePublicKey, DerpFrame>()
+    private val resetBarriers = mutableSetOf<NodePublicKey>()
     private var reader: PlatformThread? = null
     private var writer: PlatformThread? = null
-    private var restartDelay = 250L
+    private var reconnectRequested = false
+    // A failed advertised fast-start capability falls back on the next fresh connection only.
+    private var fastStartAllowed = true
 
-    fun start(timeoutMillis: Long = 30_000) {
+    override val connectionGeneration: Long? get() = lock.withLock { if (ready && !closed) generation else null }
+
+    override fun start(timeoutMillis: Long) {
         lock.withLock {
             check(reader == null) { "DERP already started" }
             require(nodes.isNotEmpty()) { "No DERP nodes" }
@@ -55,10 +61,32 @@ internal class DerpTransport(
             if (closed) throw TailcatClosedException()
         }
     }
-    fun send(key: NodePublicKey, packet: ByteArray) {
+    override fun send(key: NodePublicKey, packet: ByteArray) {
         require(packet.size <= 65536)
         enqueue(DerpFrame(4, key.raw + packet))
     }
+    override fun setResetBarrier(key: NodePublicKey, blocked: Boolean) = lock.withLock {
+        if (closed) return@withLock
+        if (blocked) { require(key in resetBarriers || resetBarriers.size < 1024); resetBarriers.add(key) }
+        else resetBarriers.remove(key)
+        lock.signalAll()
+    }
+    override fun queueResetMarker(key: NodePublicKey, packet: ByteArray) = lock.withLock {
+        if (closed) throw TailcatClosedException()
+        require(packet.size == 32 && io.tailcat.wireguard.WireGuard.packetType(packet) == 4)
+        require(key in resetMarkers || resetMarkers.size < 1024)
+        resetMarkers[key] = DerpFrame(4, key.raw + packet)
+        resetBarriers.remove(key); lock.signalAll()
+    }
+    override fun hasResetMarker(key: NodePublicKey): Boolean = lock.withLock { key in resetMarkers }
+    override fun discardResetMarker(key: NodePublicKey) = lock.withLock {
+        resetMarkers.remove(key); resetBarriers.remove(key); lock.signalAll()
+    }
+    /** Handshakes, meow, discovery and other peers must progress even without a usable marker key. */
+    private fun blocked(frame: DerpFrame): Boolean = frame.type == 4 && frame.payload.size >= 36 &&
+        frame.payload[32] == 4.toByte() && frame.payload[33] == 0.toByte() && frame.payload[34] == 0.toByte() && frame.payload[35] == 0.toByte() &&
+        NodePublicKey(frame.payload.copyOfRange(0, 32)) in resetBarriers
+    private fun nextWrite(): DerpFrame? = resetMarkers.values.firstOrNull() ?: queue.firstOrNull { !blocked(it) }
     private fun enqueue(frame: DerpFrame) {
         lock.withLock {
             if (closed) throw TailcatClosedException()
@@ -66,7 +94,7 @@ internal class DerpTransport(
             queue.addLast(frame); lock.signalAll()
         }
     }
-    fun tick(now: Long) {
+    override fun tick(now: Long) {
         var close: PlatformStream? = null
         lock.withLock {
             if (closed) return
@@ -78,11 +106,18 @@ internal class DerpTransport(
         }
         close?.close()
     }
-    fun reconnect() { lock.withLock { stream }?.close() }
-    fun close() {
+    override fun reconnect() {
         val old = lock.withLock {
             if (closed) return
-            closed = true; ready = false; generation++; queue.clear(); lock.signalAll()
+            generation++; ready = false; reconnectRequested = true; lock.signalAll()
+            stream.also { stream = null }
+        }
+        old?.close()
+    }
+    override fun close() {
+        val old = lock.withLock {
+            if (closed) return
+            closed = true; ready = false; generation++; queue.clear(); resetMarkers.clear(); resetBarriers.clear(); lock.signalAll()
             stream.also { stream = null }
         }
         old?.close()
@@ -92,20 +127,25 @@ internal class DerpTransport(
         while (true) {
             lock.withLock {
                 if (closed) return
-                if (delay > 0) lock.await(delay)
+                val retryAt = monotonicMillis() + delay
+                while (!closed && !reconnectRequested && monotonicMillis() < retryAt) lock.await((retryAt - monotonicMillis()).coerceAtLeast(1))
                 if (closed) return
+                reconnectRequested = false
             }
             val connection = PlatformStream()
-            val id = lock.withLock {
-                generation++; phaseStarted = monotonicMillis(); stream = connection; ready = false
-                generation
-            }
             try {
+                val id = lock.withLock {
+                    if (closed) { connection.close(); return }
+                    generation++; phaseStarted = monotonicMillis(); stream = connection; ready = false
+                    generation
+                }
                 val node = nodes[nodeIndex]
+                trace?.mark("derpAttempt", id)
                 establish(connection, node)
                 lock.withLock {
                     if (closed || stream !== connection) throw TailcatClosedException()
                     ready = true; lastReceived = monotonicMillis(); lastPing = lastReceived; lock.signalAll()
+                    trace?.mark("derpReady", id)
                 }
                 delay = 250
                 while (true) {
@@ -144,16 +184,16 @@ internal class DerpTransport(
     private fun runWriter() {
         while (true) {
             val work = lock.withLock {
-                while (!closed && (!ready || queue.isEmpty())) lock.await(1000)
+                while (!closed && (!ready || nextWrite() == null)) lock.await(1000)
                 if (closed) return
-                Triple(stream!!, generation, queue.first())
+                Triple(stream!!, generation, nextWrite()!!)
             }
             try {
                 val size = work.third.payload.size + 5
                 while (true) {
                     val wait = lock.withLock {
                         if (closed) return
-                        if (generation != work.second || !ready) return@withLock -1L
+                        if (generation != work.second || !ready || nextWrite() !== work.third) return@withLock -1L
                         if (rate <= 0 || burst <= 0) 0L else {
                             require(size <= burst) { "DERP frame exceeds relay burst limit" }
                             val now = monotonicMillis()
@@ -163,8 +203,18 @@ internal class DerpTransport(
                     }
                     if (wait < 0) break
                     if (wait == 0L) {
+                        // Commit selection before I/O without holding the state lock across a socket write.
+                        // A reset can cancel a not-yet-committed write; already committed prior work may finish.
+                        val current = lock.withLock { !closed && ready && generation == work.second && nextWrite() === work.third }
+                        if (!current) break
                         writes.withLock { work.first.write(work.third.encode()) }
-                        lock.withLock { if (queue.firstOrNull() === work.third) queue.removeFirst() }
+                        if (trace != null && work.third.type == 4 && work.third.payload.size >= 36 &&
+                            work.third.payload.copyOfRange(32, 36).contentEquals("meow".encodeToByteArray())) trace.markOnce("meowWritten")
+                        lock.withLock {
+                            val marker = resetMarkers.entries.firstOrNull { it.value === work.third }?.key
+                            if (marker != null) resetMarkers.remove(marker) else queue.remove(work.third)
+                            lock.signalAll()
+                        }
                         break
                     }
                     lock.withLock { if (!closed) lock.await(wait.coerceAtMost(1000)) }
@@ -178,37 +228,17 @@ internal class DerpTransport(
         require(node.hostName.none { it == '\r' || it == '\n' })
         if (testOnlyPlaintext) require(host in listOf("127.0.0.1", "::1", "localhost", "10.0.2.2")) { "Plain DERP requires explicit local fixture" }
         connection.connect(host, node.derpPort.takeIf { it > 0 } ?: 443, !testOnlyPlaintext,
-            serverName = node.hostName, certificateName = node.certName.ifEmpty { node.hostName }, insecureForTests = node.insecureForTests)
-        connection.write("GET /derp HTTP/1.1\r\nHost: ${node.hostName}\r\nUpgrade: DERP\r\nConnection: Upgrade\r\n\r\n".encodeToByteArray())
-        // Read the header exactly, preserving subsequent DERP bytes in the socket.
-        val header = ArrayList<Byte>()
-        val one = ByteArray(1)
-        while (true) {
-            require(header.size < 16384)
-            if (connection.read(one) != 1) throw TailcatClosedException()
-            header.add(one[0])
-            if (header.size >= 4 && header.takeLast(4) == listOf<Byte>(13, 10, 13, 10)) break
+            serverName = node.hostName, certificateName = node.certName.ifEmpty { node.hostName }, insecureForTests = node.insecureForTests, startupTrace = trace)
+        val metadata = connection.derpTlsMetadata.takeIf { fastStartAllowed && !testOnlyPlaintext && !node.insecureForTests }
+        val info = try {
+            DerpHandshake(privateKey, node.hostName, metadata, trace, connection::read, { connection.write(it) }).authenticate()
+        } catch (failure: Exception) {
+            if (metadata != null) { fastStartAllowed = false; trace?.mark("derpFastStartFailed") }
+            throw failure
         }
-        val lines = header.toByteArray().decodeToString(throwOnInvalidSequence = true).split("\r\n")
-        require(lines.first().startsWith("HTTP/1.1 101 ") || lines.first() == "HTTP/1.1 101")
-        val headers = lines.drop(1).filter { it.isNotEmpty() }.associate { line ->
-            val colon = line.indexOf(':'); require(colon > 0)
-            line.substring(0, colon).lowercase() to line.substring(colon + 1).trim().lowercase()
-        }
-        require(headers["upgrade"] == "derp" && headers["connection"]?.split(',')?.any { it.trim() == "upgrade" } == true)
-        val greeting = readFrame(connection)
-        require(greeting.type == 1 && greeting.payload.size in 40..1024 && greeting.payload.startsWith("DERP🔑".encodeToByteArray()))
-        val serverKey = greeting.payload.copyOfRange(8, 40); val nonce = secureRandom(24)
-        val info = "{\"version\":2,\"CanAckPings\":true}".encodeToByteArray()
-        connection.write(DerpFrame(2, privateKey.publicKey.raw + nonce + NaClBox.seal(info, nonce, serverKey, privateKey.raw)).encode())
-        val frame = readFrame(connection)
-        require(frame.type == 3 && frame.payload.size in 40..65536)
-        val serverInfo = NaClBox.open(frame.payload.copyOfRange(24, frame.payload.size), frame.payload.copyOfRange(0, 24), serverKey, privateKey.raw)
-        val json = Json.parse(serverInfo.decodeToString(throwOnInvalidSequence = true)) as? Map<*, *> ?: error("Expected DERP server info")
-        require(((json["version"] as? Number)?.toInt() ?: 0) >= 2)
         lock.withLock {
-            rate = ((json["TokenBucketBytesPerSecond"] as? Number)?.toDouble() ?: 0.0).coerceAtLeast(0.0)
-            burst = ((json["TokenBucketBytesBurst"] as? Number)?.toDouble() ?: 0.0).coerceAtLeast(0.0)
+            rate = info.rate
+            burst = info.burst
             tokens = burst; tokenAt = monotonicMillis()
         }
         connection.write(DerpFrame(7, byteArrayOf(1)).encode())

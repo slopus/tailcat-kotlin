@@ -133,6 +133,115 @@ Closing an owner interrupts its pending operations and closes its sockets. A
 timeout of zero waits indefinitely on reads, writes and accepts; client startup
 has a configurable positive `connectTimeoutMillis`.
 
+For a known peer, connect once during your feature's startup or foreground work
+and retain that `TailcatClient`. Its authenticated DERP connection stays open,
+including while traffic uses a direct path, and reconnects after relay failures.
+Later `client.dialTCP(...)` calls reuse the same client, relay transport and
+WireGuard session; they create only another TCP stream inside the tunnel. Reuse
+an existing stream when you want to avoid even that stream handshake. Close the
+client when the owning feature no longer needs it. Mobile suspension and network
+loss can interrupt connectivity; retaining an object is not an OS background
+execution guarantee.
+
+This known-peer prewarming needs no separate API: call `TailcatClient.connect`
+before the first application request. Each new client instance still establishes
+its own peer-specific relay transport and encrypted session; this library does
+not provide a peer-independent preconnected node or a shared client relay pool.
+
+## Optional relay-first connections
+
+Separate calls to `TailcatClient.connect` still create independent clients and
+their own DERP connections, WireGuard sessions, and UDP sockets. JVM/Android can
+use DERP's standard fast-start capability advertised inside a verified TLS 1.3
+handshake; unsupported relays and Linux Native use normal registration. Across
+platforms, authenticated discovery starts immediately when its gate opens, and
+empty probe rounds do not delay the first real candidate. These optimizations
+are automatic: no new public API, connection pooling, or standby prewarming. The
+[independent-client benchmark](Documentation/Benchmark.md#second-independent-client-startup)
+measures a second fresh client while the first stays connected, separately from
+the reused-client warm-stream measurement.
+
+Set `relayFirst = true` independently on either end. The default remains `false`.
+
+```kotlin
+val server = TailcatServer(ServerConfiguration(relayFirst = true))
+val address = server.start()
+val client = TailcatClient.connect(address, ClientConfiguration(relayFirst = true))
+
+client.retryDirect()                  // Background retry; keeps a healthy current path.
+server.retryDirect(client.publicKey)  // One peer, or omit the key for every peer.
+
+client.notifyNetworkChanged()         // Invalidate old paths, rebind UDP, reconnect DERP.
+server.notifyNetworkChanged()
+```
+
+In this mode, UDP binding, interface enumeration and STUN do not block DERP
+startup or relay traffic. `connect` still waits for the authenticated WireGuard
+session, including its encrypted confirmation sent through DERP; it does not
+mean merely "relay socket open." DERP map loading, region selection, relay DNS,
+TLS and peer authentication can still delay or fail startup. `server.start()`
+means the server is listening through its relay, not that a client is connected.
+Relay-first therefore does not mean zero cold-start setup. In the benchmarks,
+"cold" starts with a fresh client process; "warm" opens another TCP stream on an
+already-connected client. Message RTT on an existing stream is a separate metric
+from the warm stream's handshake and first response.
+
+After authentication, background discovery upgrades the same session only after
+an encrypted discovery Pong matches the peer, endpoint and outstanding probe.
+Existing TCP streams and UDP flows stay attached to that session; keys, identity,
+address encoding and the wire protocol are unchanged. A relay-first endpoint
+interoperates with a default-mode endpoint. `client.path` and `server.path(key)`
+report the selected outbound route; `Relay` is not a relay-health guarantee.
+
+`retryDirect()` is non-blocking and coalesced: it does not tear down a working
+direct path, reconnect DERP or create a new session. `notifyNetworkChanged()`
+invalidates old endpoint/probe generations, closes and rebinds UDP sockets,
+reconnects DERP, and rediscovers in the background. `resetNetworkPaths()` remains
+an alias for this network-change operation. Requests after close fail with
+`TailcatClosedException`; closing cancels retries and prevents late discovery
+results from restoring a route.
+
+The discovery worker polls local addresses roughly every five seconds on JVM,
+Android and Linux Native; there is no platform connectivity callback subscription.
+Hosts should call `notifyNetworkChanged()` for Wi-Fi/cellular/VPN/default-route
+changes, especially when the local address list stays the same. Blocking platform
+discovery calls run outside the transport lock and cannot stall relay traffic or
+close. They cannot always be interrupted: one old call can delay fresh direct
+discovery until it returns, but its stale result is discarded and repeated
+notifications do not accumulate discovery workers.
+
+Failed direct probes back off from one to at most 30 seconds, with a global
+32-probe/second budget and at most eight endpoints per peer per round. Validated
+paths are reprobed about every ten seconds. New authenticated endpoint advertisements inside the probe rate limit are queued
+for the next allowed probe, including when only the remote peer changes networks.
+If an authenticated, nonempty advertisement withdraws the selected endpoint from
+the peer's previous nonempty advertisement, traffic falls back to DERP until a
+replacement is validated. Empty or unchanged advertisements do not discard a
+working path, and older outstanding Pongs cannot restore a withdrawn route.
+Local path resets queue an authenticated empty WireGuard transport packet through
+DERP before application data, using the existing keepalive wire format. A peer
+recognizes a fresh relay-carried empty packet on an established session as a
+discrete reset hint and revalidates its return path. Initial key confirmations,
+forged packets and replayed markers cannot trigger it; ordinary application data
+never demotes a path. Marker counters are tracked separately from data because
+direct data can overtake the relay hint. Peer-induced fallback does not send a
+reflexive marker. Older implementations still accept the unchanged WireGuard
+packet, but may rely on discovery/lease expiry for prompt return-path recovery.
+Fast marker-assisted one-sided recovery requires the receiving peer to run the
+updated library. Mixing `relayFirst = true` and `false` on updated peers is not
+the same as testing an older library binary; the mixed-mode tests cover the former.
+A local UDP send error immediately
+retries that ciphertext through DERP; a silent blackhole falls back when the last
+valid Pong is 30 seconds old. Application sends do not extend this lease. Relay
+disconnects reconnect with bounded backoff while a healthy direct path remains
+usable, and relay receive stays active even after a direct upgrade.
+
+Route changes are not lossless delivery guarantees: datagrams may be lost or
+reordered, TCP uses its existing retransmission/timeouts, and long outages can
+exhaust bounded queues or expire sessions (including the server's five-minute
+peer inactivity limit). Neither mode guarantees direct NAT traversal or indefinite
+offline session survival.
+
 ## Send UDP datagrams
 
 Configure this separate echo server for UDP port 5353. The selector runs for
@@ -204,7 +313,7 @@ streams with half-close propagation.
 
 DERP provides the initial route and stays available when direct UDP cannot
 connect. `client.path` and `server.path(key)` report the current route. Local
-interface changes refresh discovery; call `resetNetworkPaths()` after a known
+interface changes refresh discovery; call `notifyNetworkChanged()` after a known
 network change. Relay regions come from Tailcat's DERP map,
 `https://tailcat.dev/derpmap.json`, cached for an hour and revalidated with its
 ETag; a failed refresh uses the cached map. Pass a `DERPMapProvider` with another

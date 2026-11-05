@@ -1,5 +1,8 @@
 package io.tailcat.platform
 
+import io.tailcat.StartupTrace
+import io.tailcat.DerpTlsMetadata
+
 /** System facilities only. The protocol and packet stack live in common Kotlin. */
 internal expect class PlatformLock() {
     fun lock()
@@ -38,7 +41,8 @@ internal expect class PlatformUdp(bindPort: Int = 0, ipv6: Boolean = false) {
 }
 
 internal expect class PlatformStream() {
-    fun connect(host: String, port: Int, tls: Boolean, serverName: String = host, certificateName: String = serverName, timeoutMillis: Int = 10000, insecureForTests: Boolean = false)
+    val derpTlsMetadata: DerpTlsMetadata?
+    fun connect(host: String, port: Int, tls: Boolean, serverName: String = host, certificateName: String = serverName, timeoutMillis: Int = 10000, insecureForTests: Boolean = false, startupTrace: StartupTrace? = null)
     fun read(buffer: ByteArray, offset: Int = 0, length: Int = buffer.size - offset): Int
     fun write(buffer: ByteArray, offset: Int = 0, length: Int = buffer.size - offset)
     fun close()

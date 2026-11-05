@@ -2,6 +2,8 @@
 package io.tailcat.platform
 
 import io.tailcat.openssl.*
+import io.tailcat.StartupTrace
+import io.tailcat.DerpTlsMetadata
 import kotlinx.cinterop.*
 import platform.posix.*
 import platform.linux.inet_pton
@@ -108,6 +110,8 @@ private fun <T> withoutSigpipe(block: () -> T): T = memScoped {
     }
 }
 internal actual class PlatformStream actual constructor() {
+    // Native TLS retains its existing authenticated HTTP upgrade path.
+    actual val derpTlsMetadata: DerpTlsMetadata? get() = null
     private val state = PlatformLock(); private val connectLock = PlatformLock(); private val readLock = PlatformLock(); private val writeLock = PlatformLock(); private val sslLock = PlatformLock()
     private var descriptor = -1; private var context: CPointer<SSL_CTX>? = null; private var ssl: CPointer<SSL>? = null
     private var connected = false; private var closed = false; private var active = 0
@@ -122,13 +126,15 @@ internal actual class PlatformStream actual constructor() {
             TLSResult(count, code, osError, description)
         }
     }
-    actual fun connect(host: String, port: Int, tls: Boolean, serverName: String, certificateName: String, timeoutMillis: Int, insecureForTests: Boolean) {
+    actual fun connect(host: String, port: Int, tls: Boolean, serverName: String, certificateName: String, timeoutMillis: Int, insecureForTests: Boolean, startupTrace: StartupTrace?) {
         require(port in 1..65535 && timeoutMillis > 0); connectLock.lock()
         try {
             state.withLock { check(!closed && !connected && active == 0); active++ }
             try {
                 val deadline = monotonicMillis() + timeoutMillis
+                startupTrace?.mark("resolveStart")
                 val addresses = nativeResolve(host, port, SOCK_STREAM, deadline = deadline, ensureOpen = ::ensureOpen)
+                startupTrace?.mark("resolveDone")
                 var lastFailure: Throwable? = null; var established = false
                 for (address in addresses) {
                     ensureOpen(); val fd = socket(address.family, SOCK_STREAM, IPPROTO_TCP); check(fd >= 0) { "TCP socket: $errno" }
@@ -136,6 +142,7 @@ internal actual class PlatformStream actual constructor() {
                     try {
                         ensureOpen(); nonblocking(fd)
                         memScoped { val enabled = alloc<IntVar>(); enabled.value = 1; check(setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, enabled.ptr, sizeOf<IntVar>().toUInt()) == 0) }
+                        startupTrace?.mark("tcpConnectStart")
                         var result = 0; socketAddress(address) { pointer, size -> result = platform.posix.connect(fd, pointer, size) }
                         if (result != 0) {
                             check(errno == EINPROGRESS || errno == EALREADY || errno == EINTR) { "TCP connect: $errno" }
@@ -146,6 +153,7 @@ internal actual class PlatformStream actual constructor() {
                                 check(getsockopt(fd, SOL_SOCKET, SO_ERROR, error.ptr, size.ptr) == 0 && error.value == 0) { "TCP connect: ${error.value}" }
                             }
                         }
+                        startupTrace?.mark("tcpConnected")
                         established = true; break
                     } catch (error: Throwable) {
                         lastFailure = error; state.withLock { if (descriptor == fd) { platform.posix.close(fd); descriptor = -1 } }; ensureOpen()
@@ -153,6 +161,7 @@ internal actual class PlatformStream actual constructor() {
                 }
                 if (!established) throw (lastFailure ?: IllegalStateException("No address for $host"))
                 if (tls) {
+                    startupTrace?.mark("tlsFactoryStart")
                     val createdContext = SSL_CTX_new(TLS_client_method()) ?: error("SSL_CTX_new: ${opensslErrors()}")
                     state.withLock { context = createdContext }
                     if (!insecureForTests) check(SSL_CTX_set_default_verify_paths(createdContext) == 1) { "Loading TLS trust: ${opensslErrors()}" }
@@ -167,6 +176,8 @@ internal actual class PlatformStream actual constructor() {
                         val verified = if (numericIP(certificateName)) X509_VERIFY_PARAM_set1_ip_asc(verification, certificateName) else X509_VERIFY_PARAM_set1_host(verification, certificateName, 0u)
                         check(verified == 1) { "Setting TLS certificate name" }
                     }
+                    startupTrace?.mark("tlsFactoryDone")
+                    startupTrace?.mark("tlsHandshakeStart")
                     while (true) {
                         ensureOpen(); val result = tlsOperation(connection) { SSL_connect(connection) }; if (result.count == 1) break
                         if (result.error == 2 || result.error == 3) check(ready(descriptor, if (result.error == 2) POLLIN else POLLOUT, deadline, ::ensureOpen)) { "TLS handshake timed out" }
@@ -174,6 +185,7 @@ internal actual class PlatformStream actual constructor() {
                         else error("TLS handshake: ${result.description} (SSL ${result.error}, errno ${result.systemError})")
                     }
                     if (!insecureForTests) check(SSL_get_verify_result(connection) == 0L) { "TLS certificate verification failed" }
+                    startupTrace?.mark("tlsHandshakeDone")
                 }
                 state.withLock { check(!closed) { "Stream closed" }; connected = true }
             } catch (error: Throwable) { close(); throw error } finally { release() }

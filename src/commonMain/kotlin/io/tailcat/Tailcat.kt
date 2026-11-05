@@ -25,12 +25,16 @@ data class ServerConfiguration(
     val udpIdleTimeoutMillis: Long = 120_000,
     /** Explicit local integration fixture option. Never inferred from address x. */
     val testOnlyPlaintextDERP: Boolean = false,
+    /** Establish encrypted sessions through DERP before upgrading to validated direct paths. */
+    val relayFirst: Boolean = false,
 )
 data class ClientConfiguration(
     val privateKey: NodePrivateKey? = null,
     val mapProvider: DERPMapProvider = DERPMapProvider(),
     val connectTimeoutMillis: Long = 30_000,
     val testOnlyPlaintextDERP: Boolean = false,
+    /** Do not wait for UDP setup, interface enumeration or STUN before connecting through DERP. */
+    val relayFirst: Boolean = false,
 )
 
 /** Embedded server. Blocking methods may be used from an application executor. */
@@ -69,7 +73,11 @@ class TailcatServer(private val configuration: ServerConfiguration = ServerConfi
     fun peerKey(connection: TailcatUDPConnection): NodePublicKey? = connection.peer ?: current().peerKey(connection.remoteAddress)
     fun disconnectClient(key: NodePublicKey) = current().disconnect(key)
     fun path(key: NodePublicKey): ConnectionPath = current().path(key)
-    fun resetNetworkPaths() = current().resetNetworkPaths()
+    /** Request background probing without interrupting established sessions or validated paths. */
+    fun retryDirect(key: NodePublicKey? = null) = current().retryDirect(key)
+    /** Notify an interface/route change: discard old candidates, rebind UDP and reconnect DERP. */
+    fun notifyNetworkChanged() = current().resetNetworkPaths()
+    fun resetNetworkPaths() = notifyNetworkChanged()
     fun close() { val old = lock.withLock { closed = true; engine }; old?.close() }
 }
 
@@ -83,28 +91,40 @@ class TailcatClient private constructor(private val engine: TailcatEngine) {
     fun dialUDP(endpoint: TailcatEndpoint): TailcatUDPConnection = engine.dialUDP(endpoint)
     fun openTCP(port: Int): TailcatConnection = dialTCP(port)
     fun openUDP(port: Int): TailcatUDPConnection = dialUDP(port)
-    fun resetNetworkPaths() = engine.resetNetworkPaths()
+    /** Request background probing without interrupting the current session or validated path. */
+    fun retryDirect() = engine.retryDirect(serverAddress.serverPublicKey)
+    /** Notify an interface/route change, invalidating old paths without recreating this client. */
+    fun notifyNetworkChanged() = engine.resetNetworkPaths()
+    fun resetNetworkPaths() = notifyNetworkChanged()
     fun close() = engine.close()
     companion object {
         fun connect(text: String, configuration: ClientConfiguration = ClientConfiguration()): TailcatClient = connect(TailcatAddress.parse(text), configuration)
         fun connect(address: TailcatAddress, configuration: ClientConfiguration = ClientConfiguration()): TailcatClient {
+            return connectTraced(address, configuration, null)
+        }
+        internal fun connectTraced(address: TailcatAddress, configuration: ClientConfiguration, trace: StartupTrace?): TailcatClient {
+            trace?.mark("connectStart")
             require(configuration.connectTimeoutMillis > 0)
             val deadline = monotonicMillis() + configuration.connectTimeoutMillis
             val disco = address.serverDiscoPublicKey
             require(disco != null && disco.any { it != 0.toByte() }) { "Missing server discovery key" }
             val regions = try {
+                trace?.mark("mapExpandStart")
                 configuration.mapProvider.expand(address) { monotonicMillis() >= deadline }
             } catch (failure: Exception) {
                 if (monotonicMillis() >= deadline) throw TailcatTimeoutException()
                 throw failure
             }
             require(regions.isNotEmpty()) { "No relay region" }
+            trace?.mark("mapExpandDone")
             val expanded = TailcatAddress(address.serverPublicKey, disco, address.presharedKey, regions, address.regionID)
             val prepared = TailcatEngine(configuration.privateKey ?: NodePrivateKey.generate(), expanded, false,
-                ServerConfiguration(testOnlyPlaintextDERP = configuration.testOnlyPlaintextDERP))
+                ServerConfiguration(testOnlyPlaintextDERP = configuration.testOnlyPlaintextDERP, relayFirst = configuration.relayFirst), trace)
+            trace?.mark("engineCreated")
             try {
                 prepared.start((deadline-monotonicMillis()).coerceAtLeast(1))
                 prepared.awaitConnected((deadline-monotonicMillis()).coerceAtLeast(1))
+                trace?.mark("connectReturn")
                 return TailcatClient(prepared)
             } catch (failure: Exception) { prepared.close(); if (monotonicMillis() >= deadline) throw TailcatTimeoutException(); throw failure }
         }
@@ -112,12 +132,13 @@ class TailcatClient private constructor(private val engine: TailcatEngine) {
 }
 
 internal class TailcatEngine(private val identity: NodePrivateKey, val address: TailcatAddress,
-    private val server: Boolean, private val configuration: ServerConfiguration) {
+    private val server: Boolean, private val configuration: ServerConfiguration, private val trace: StartupTrace? = null) {
     val publicKey = identity.publicKey
     private class Peer(val wg: WireGuard, val disco: ByteArray, val created: Long) {
         var acknowledged = false; var authenticated = false; var admitted = false; var admissionPending = false
         var token = 0L; var lastReceived = created; var lastSend = created; var lastMeow = -100_000L; var lastHandshake = -100_000L
         val pending = ArrayDeque<ByteArray>(); var pendingBytes = 0
+        val resetCounters = linkedMapOf<Long, ULong>()
     }
     private sealed class Event {
         class Incoming(val key: NodePublicKey, val packet: ByteArray, val relay: Boolean) : Event()
@@ -143,7 +164,8 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
     private var nextToken = 1L
     private var admissionJobs = 0
     private var handlerJobs = 0
-    private val network = NetworkTransport(identity, address.regions.first().nodes, configuration.testOnlyPlaintextDERP) { key, packet, relay -> offer(Event.Incoming(key, packet, relay)) }
+    private val network = NetworkTransport(identity, address.regions.first().nodes, configuration.testOnlyPlaintextDERP,
+        relayFirst = configuration.relayFirst, trace = trace) { key, packet, relay -> offer(Event.Incoming(key, packet, relay)) }
     private val stack = newStack(publicKey.address)
     private fun newStack(address: ByteArray): IPStack = IPStack(address, { offer(Event.Outgoing(it)) },
         if (server) null else this.address.serverPublicKey, { raw -> peerKey(raw) })
@@ -178,6 +200,7 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
         }
     }
     fun awaitConnected(timeoutMillis: Long) = lock.withLock {
+        trace?.mark("awaitConnectedStart")
         val end = monotonicMillis() + timeoutMillis
         while (!closed && peers[address.serverPublicKey]?.wg?.isEstablished != true) {
             val remaining = end - monotonicMillis(); if (remaining <= 0) throw TailcatTimeoutException(); lock.await(remaining)
@@ -199,6 +222,7 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
     fun peerKey(raw: ByteArray): NodePublicKey? = bindingsLock.withLock { bindings[BytesKey(raw)] }
     fun path(key: NodePublicKey): ConnectionPath = network.path(key)
     fun resetNetworkPaths() = network.networkChanged()
+    fun retryDirect(key: NodePublicKey?) = network.retryDirect(key)
     fun disconnect(key: NodePublicKey) = lock.withLock { removePeer(key) }
     private fun removePeer(key: NodePublicKey) {
         peers.remove(key)?.token = nextToken++
@@ -230,26 +254,44 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
                     try { network.configurePeer(key, disco) } catch (failure: Exception) { removePeer(key); throw failure }
                 } else if (!peer.disco.contentEquals(disco)) return
                 network.send(key, "meow\u0002".encodeToByteArray())
-            } else if (key == address.serverPublicKey && packet.contentEquals("meow\u0002".encodeToByteArray())) peers[key]?.acknowledged = true
+            } else if (key == address.serverPublicKey && packet.contentEquals("meow\u0002".encodeToByteArray())) {
+                peers[key]?.acknowledged = true
+                trace?.markOnce("meowAck")
+            }
             return
         }
         val peer = peers[key] ?: return
+        val wasAuthenticated = peer.authenticated
         val now = monotonicMillis(); val result = peer.wg.receive(packet, now)
-        result.response?.let { network.send(key, it); peer.lastSend = now }
+        if (result.handshakeCompleted) trace?.markOnce("wgEstablished")
+        result.response?.let { sendPeerPacket(key, peer, it); peer.lastSend = now }
         if (result.handshakeCompleted || WireGuard.packetType(packet) == 4) {
             peer.authenticated = true; peer.lastReceived = now
+            network.authenticated(key)
             if (server && !peer.admitted && !peer.admissionPending) beginAdmission(key, peer)
         }
         if (result.handshakeCompleted) { flush(key, peer); lock.signalAll() }
+        if (event.relay && wasAuthenticated && !result.handshakeCompleted && packet.size == 32 && WireGuard.packetType(packet) == 4) {
+            // Empty transport is already a valid WireGuard packet. No new message type or crypto.
+            // Only markers affect this history: newer direct data may overtake a queued relay marker.
+            val index = (0..3).fold(0L) { value, i -> value or (packet[4 + i].u().toLong() shl (8 * i)) }
+            val counter = (0..7).fold(0UL) { value, i -> value or (packet[8 + i].u().toULong() shl (8 * i)) }
+            val previous = peer.resetCounters[index]
+            if (counter > 0UL && (previous == null || counter > previous)) {
+                peer.resetCounters.remove(index)
+                if (peer.resetCounters.size >= 3) peer.resetCounters.remove(peer.resetCounters.keys.first())
+                peer.resetCounters[index] = counter
+                network.authenticatedRelayReset(key)
+            }
+        }
         val ip = result.plaintext ?: return
         if (!peer.admitted || ip.size < 40 || ip[0].u() ushr 4 != 6) return
         if (server) {
             if (!ip.copyOfRange(8, 24).contentEquals(key.address)) return
-            deliverServerIP(ip)
         } else {
             if (!ip.copyOfRange(24, 40).contentEquals(publicKey.address)) return
-            stack.receive(ip)
         }
+        if (server) deliverServerIP(ip) else stack.receive(ip)
     }
     private fun beginAdmission(key: NodePublicKey, peer: Peer) {
         val hook = configuration.allowClient
@@ -270,17 +312,40 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
         if (!event.allowed) { removePeer(event.key); return }
         peer.admitted = true; bindingsLock.withLock { bindings[BytesKey(event.key.address)] = event.key }
     }
+    /** Only the engine owns WG crypto. Never call back into it from the network/DERP locks. */
+    private fun prepareResetMarker(key: NodePublicKey, peer: Peer) {
+        val token = network.pendingResetMarker(key) ?: return
+        val marker = try {
+            if (peer.wg.isEstablished) {
+                var encrypted = peer.wg.encrypt(byteArrayOf(), monotonicMillis())
+                // A responder may not have sent its first transport packet yet. Reserve counter zero
+                // for confirmation semantics; a deliberate reset must be distinguishable from it.
+                if ((8..15).all { encrypted[it] == 0.toByte() }) encrypted = peer.wg.encrypt(byteArrayOf(), monotonicMillis())
+                encrypted
+            } else null
+        }
+        catch (_: Exception) { null }
+        network.completeResetMarker(key, token, marker)
+    }
+    private fun sendPeerPacket(key: NodePublicKey, peer: Peer, packet: ByteArray) {
+        repeat(4) {
+            prepareResetMarker(key, peer)
+            if (network.trySend(key, packet)) return
+        }
+        // Continuous host notifications cannot monopolize the engine; TCP retains its retransmission.
+        throw TailcatException("Network is changing during send")
+    }
     private fun sendIP(packet: ByteArray) {
         if (packet.size < 40) return
         val key = if (server) peerKey(packet.copyOfRange(24, 40)) ?: return else address.serverPublicKey
         val peer = peers[key] ?: return
-        if (peer.wg.isEstablished) { network.send(key, peer.wg.encrypt(packet, monotonicMillis())); peer.lastSend = monotonicMillis() }
+        if (peer.wg.isEstablished) { sendPeerPacket(key, peer, peer.wg.encrypt(packet, monotonicMillis())); peer.lastSend = monotonicMillis() }
         else if (peer.pendingBytes + packet.size <= 262144) { peer.pending.addLast(packet); peer.pendingBytes += packet.size }
     }
     private fun flush(key: NodePublicKey, peer: Peer) {
         while (peer.pending.isNotEmpty() && peer.wg.isEstablished) {
             val packet = peer.pending.removeFirst(); peer.pendingBytes -= packet.size
-            network.send(key, peer.wg.encrypt(packet, monotonicMillis())); peer.lastSend = monotonicMillis()
+            sendPeerPacket(key, peer, peer.wg.encrypt(packet, monotonicMillis())); peer.lastSend = monotonicMillis()
         }
     }
     private fun deliverServerIP(ip: ByteArray) {
@@ -360,12 +425,15 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
             if ((!peer.authenticated && now - peer.created > 30_000) || (server && peer.authenticated && now - peer.lastReceived > 300_000)) { removePeer(key); continue }
             try {
                 peer.wg.maintenance(now)
+                prepareResetMarker(key, peer)
                 if (!server && !peer.acknowledged && now - peer.lastMeow >= 1000) {
                     peer.lastMeow = now; network.send(key, "meow\u0001".encodeToByteArray() + publicKey.raw + identity.discoPublicKey)
+                    trace?.markOnce("meowQueued")
                 }
                 if (peer.acknowledged && (!peer.wg.isEstablished || peer.wg.needsRekey(now)) && now - peer.lastHandshake >= 5000 && (!server || peer.wg.isEstablished)) {
-                    peer.lastHandshake = now; network.send(key, peer.wg.initiate(now))
-                } else if (peer.wg.isEstablished && now - peer.lastSend >= 25_000) { network.send(key, peer.wg.encrypt(byteArrayOf(), now)); peer.lastSend = now }
+                    peer.lastHandshake = now; sendPeerPacket(key, peer, peer.wg.initiate(now))
+                    trace?.markOnce("wgInitiationQueued")
+                } else if (peer.wg.isEstablished && now - peer.lastSend >= 25_000) { sendPeerPacket(key, peer, peer.wg.encrypt(byteArrayOf(), now)); peer.lastSend = now }
             } catch (_: Exception) { network.invalidate(key) }
         }
         for ((key, activity) in targetActivity.toMap()) {

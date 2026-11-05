@@ -25,6 +25,10 @@ import javax.net.ssl.SSLPeerUnverifiedException
 import java.net.IDN
 import java.util.Locale
 import io.tailcat.IpAddress
+import io.tailcat.StartupTrace
+import io.tailcat.DerpTlsMetadata
+import io.tailcat.NodePublicKey
+import java.math.BigInteger
 
 internal actual class PlatformLock actual constructor() {
     private val mutex = ReentrantLock()
@@ -128,6 +132,8 @@ internal actual class PlatformStream actual constructor() {
     @Volatile private var closed = false
     private var socket: Socket? = null
     private var connected = false
+    private var metadata: DerpTlsMetadata? = null
+    actual val derpTlsMetadata: DerpTlsMetadata? get() = synchronized(state) { if (closed) null else metadata }
     private fun ensureOpen() { if (closed) throw IOException("Stream closed") }
     private fun remaining(deadline: Long): Int {
         ensureOpen(); val time = deadline - monotonicMillis()
@@ -151,19 +157,25 @@ internal actual class PlatformStream actual constructor() {
             catch (_: TimeoutException) { }
         }
     }
-    actual fun connect(host: String, port: Int, tls: Boolean, serverName: String, certificateName: String, timeoutMillis: Int, insecureForTests: Boolean) {
+    actual fun connect(host: String, port: Int, tls: Boolean, serverName: String, certificateName: String, timeoutMillis: Int, insecureForTests: Boolean, startupTrace: StartupTrace?) {
         require(port in 1..65535 && timeoutMillis > 0); connectLock.lock()
         try {
             synchronized(state) { ensureOpen(); check(!connected && socket == null) { "Already connected" } }
             val deadline = monotonicMillis() + timeoutMillis
+            startupTrace?.mark("tlsFactoryStart")
             val tlsFactory = if (tls) factory(insecureForTests,deadline) else null
+            startupTrace?.mark("tlsFactoryDone")
             var raw: Socket? = null; var lastError: Exception? = null
+            startupTrace?.mark("resolveStart")
             val addresses = resolve(host, deadline)
+            startupTrace?.mark("resolveDone")
             for (address in addresses) {
                 val attempt = Socket(); synchronized(state) { ensureOpen(); socket = attempt }
                 try {
                     attempt.tcpNoDelay = true
+                    startupTrace?.mark("tcpConnectStart")
                     attempt.connect(InetSocketAddress(address, port), remaining(deadline).let { if (addresses.size > 1) it.coerceAtMost(3000) else it })
+                    startupTrace?.mark("tcpConnected", attempt.localPort.toLong())
                     raw = attempt; break
                 } catch (error: Exception) {
                     attempt.close(); lastError = error; synchronized(state) { if (socket === attempt) socket = null }; ensureOpen()
@@ -171,6 +183,7 @@ internal actual class PlatformStream actual constructor() {
             }
             var established = raw ?: throw (lastError ?: IOException("No address for $host"))
             if (tls) {
+                startupTrace?.mark("tlsHandshakeStart")
                 val ssl = checkNotNull(tlsFactory).createSocket(established,certificateName,port,true) as SSLSocket
                 synchronized(state) { if (closed) { ssl.close(); throw IOException("Stream closed") }; socket = ssl }
                 val parameters = ssl.sslParameters
@@ -180,6 +193,10 @@ internal actual class PlatformStream actual constructor() {
                 ssl.enabledProtocols = ssl.supportedProtocols.filter { it == "TLSv1.2" || it == "TLSv1.3" }.toTypedArray()
                 ssl.soTimeout = remaining(deadline); ssl.startHandshake()
                 if (!insecureForTests && certificateName != serverName) verifyOverrideName(ssl, certificateName)
+                val currentMetadata = parseDerpTlsMetadata(ssl.session.protocol, !insecureForTests,
+                    ssl.session.peerCertificates.filterIsInstance<X509Certificate>().map { it.subjectX500Principal.name to it.serialNumber })
+                synchronized(state) { ensureOpen(); metadata = currentMetadata }
+                startupTrace?.mark("tlsHandshakeDone")
                 ssl.soTimeout = 0; established = ssl
             }
             synchronized(state) { ensureOpen(); socket = established; connected = true }
@@ -196,7 +213,20 @@ internal actual class PlatformStream actual constructor() {
         try { current().getOutputStream().write(buffer, offset, length) } finally { writeLock.unlock() }
     }
     actual fun close() {
-        val old = synchronized(state) { closed = true; connected = false; socket.also { socket = null } }
+        val old = synchronized(state) { closed = true; connected = false; metadata = null; socket.also { socket = null } }
         try { old?.close() } catch (_: IOException) { }
     }
+}
+
+/** The upstream metadata certificate has exactly this CN. Other subjects safely use normal DERP. */
+internal fun parseDerpTlsMetadata(protocol: String, verified: Boolean, subjects: List<Pair<String, BigInteger>>): DerpTlsMetadata? {
+    if (!verified || protocol != "TLSv1.3") return null
+    for ((subject, serial) in subjects) {
+        if (serial.signum() <= 0 || serial.bitLength() > 8) continue
+        val match = Regex("CN=derpkey([0-9a-fA-F]{64})").matchEntire(subject) ?: continue
+        val key = NodePublicKey("nodekey:" + match.groupValues[1])
+        if (key.rawValue.all { it == 0.toByte() }) continue
+        return DerpTlsMetadata(key, serial.toInt())
+    }
+    return null
 }
