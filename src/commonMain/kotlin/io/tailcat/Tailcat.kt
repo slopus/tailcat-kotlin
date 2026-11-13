@@ -151,6 +151,8 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
         var token = 0L; var lastReceived = created; var lastSend = created; var lastMeow = -100_000L; var lastHandshake = -100_000L
         val pending = ArrayDeque<ByteArray>(); var pendingBytes = 0
         val resetCounters = linkedMapOf<Long, ULong>()
+        /** Meowing and handshaking again on a session the server may have lost, until a new one is made. */
+        var rejoining = false
     }
     private sealed class Event {
         class Incoming(val key: NodePublicKey, val packet: ByteArray, val relay: Boolean) : Event()
@@ -171,6 +173,8 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
     private val tcpServices = mutableMapOf<ServiceKey, TailcatListener>()
     private val udpServices = mutableMapOf<ServiceKey, TailcatUDPListener>()
     private val selected = mutableMapOf<FlowKey, Selected>()
+    /** When each client the server holds no session for was last told to meow again. */
+    private val askedToMeow = mutableMapOf<NodePublicKey, Long>()
     private var closed = false
     private var queueClosed = false
     private var nextToken = 1L
@@ -271,16 +275,20 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
                     try { network.configurePeer(key, disco) } catch (failure: Exception) { removePeer(key); throw failure }
                 } else if (!peer.disco.contentEquals(disco)) return
                 network.send(key, "meow\u0002".encodeToByteArray())
+            } else if (key == address.serverPublicKey && packet.contentEquals(MEOW_AGAIN)) {
+                // The server holds no session for us, as after it restarted, and its old socket,
+                // the direct route's end, is gone with it.
+                network.invalidate(key); rejoin()
             } else if (key == address.serverPublicKey && packet.contentEquals("meow\u0002".encodeToByteArray())) {
                 peers[key]?.acknowledged = true
                 trace?.markOnce("meowAck")
             }
             return
         }
-        val peer = peers[key] ?: return
+        val peer = peers[key] ?: run { if (server && event.relay) askToMeowAgain(key); return }
         val wasAuthenticated = peer.authenticated
         val now = monotonicMillis(); val result = peer.wg.receive(packet, now)
-        if (result.handshakeCompleted) trace?.markOnce("wgEstablished")
+        if (result.handshakeCompleted) { trace?.markOnce("wgEstablished"); peer.rejoining = false }
         result.response?.let { sendPeerPacket(key, peer, it); peer.lastSend = now }
         if (result.handshakeCompleted || WireGuard.packetType(packet) == 4) {
             peer.authenticated = true; peer.lastReceived = now
@@ -309,6 +317,32 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
             if (!ip.copyOfRange(24, 40).contentEquals(publicKey.address)) return
         }
         if (server) deliverServerIP(ip) else stack.receive(ip)
+    }
+    /**
+     * A client still sending on a session this server doesn't have, as after it restarted, is told
+     * to meow again, at most once a second: otherwise it waits for its own timeouts.
+     */
+    private fun askToMeowAgain(key: NodePublicKey) {
+        val now = monotonicMillis()
+        if (askedToMeow[key]?.let { now - it < 1000 } == true) return
+        if (askedToMeow.size >= 1024) askedToMeow.clear()
+        askedToMeow[key] = now
+        val hook = configuration.allowClient
+        if (hook == null) { network.send(key, MEOW_AGAIN); return }
+        // Only a client it would admit; the hook may be slow, so not on the engine thread.
+        if (admissionJobs >= 128) return
+        admissionJobs++
+        startThread("tailcat-admission") {
+            val allowed = try { hook(key) } catch (_: Exception) { false }
+            lock.withLock { admissionJobs-- }
+            if (allowed) try { network.send(key, MEOW_AGAIN) } catch (_: Exception) { }
+        }
+    }
+    /** Meow and handshake again; the session stays in use until a new one replaces it. */
+    private fun rejoin() {
+        val peer = peers[address.serverPublicKey] ?: return
+        if (server || !peer.acknowledged) return
+        peer.acknowledged = false; peer.rejoining = true; peer.lastMeow = -100_000; peer.lastHandshake = -100_000
     }
     private fun beginAdmission(key: NodePublicKey, peer: Peer) {
         val hook = configuration.allowClient
@@ -449,8 +483,9 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
                 }
                 // Data waiting on a handshake retries it each second, not five: an initiation lost to a
                 // relay that died during a suspension otherwise holds that data for five seconds.
-                val spacing = if (!peer.wg.isEstablished && peer.pending.isNotEmpty()) 1000 else 5000
-                if (peer.acknowledged && (!peer.wg.isEstablished || peer.wg.needsRekey(now)) && now - peer.lastHandshake >= spacing && (!server || peer.wg.isEstablished)) {
+                // So does a rejoin, which keeps the old session in use until a new one replaces it.
+                val spacing = if ((!peer.wg.isEstablished && peer.pending.isNotEmpty()) || peer.rejoining) 1000 else 5000
+                if (peer.acknowledged && (!peer.wg.isEstablished || peer.rejoining || peer.wg.needsRekey(now)) && now - peer.lastHandshake >= spacing && (!server || peer.wg.isEstablished)) {
                     peer.lastHandshake = now; sendPeerPacket(key, peer, peer.wg.initiate(now))
                     trace?.markOnce("wgInitiationQueued")
                 } else if (peer.wg.isEstablished && now - peer.lastSend >= 25_000) { sendPeerPacket(key, peer, peer.wg.encrypt(byteArrayOf(), now)); peer.lastSend = now }
@@ -466,6 +501,9 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
         }
     }
 }
+
+/** A server's answer to a packet on a session it doesn't hold: meow again. */
+private val MEOW_AGAIN = "meow\u0003".encodeToByteArray()
 
 /** Copy streams in both directions, propagating each EOF as a FIN. */
 fun proxyConnections(first: TailcatConnection, second: TailcatConnection, timeoutMillis: Long = 0) {

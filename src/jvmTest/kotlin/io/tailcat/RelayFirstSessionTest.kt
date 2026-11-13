@@ -417,6 +417,45 @@ class RelayFirstSessionTest {
         }
     }
 
+    /** A server restarted with the same key: same address, none of its sessions or admissions. */
+    private class RestartableServer(private val relay: LocalRelay, private val handler: TailcatTCPHandler) : AutoCloseable {
+        private val key = NodePrivateKey.generate()
+        private val psk = PresharedKey.generate()
+        @Volatile var server = make()
+        val address = server.start()
+        private fun make() = TailcatServer(ServerConfiguration(privateKey = key, presharedKey = psk, region = relay.region,
+            testOnlyPlaintextDERP = true, relayFirst = true, onTCP = { handler }))
+        fun restart() {
+            server.close()
+            server = make()
+            check(server.start().encode() == address.encode())
+        }
+        override fun close() = server.close()
+    }
+    private val meowAgain = "meow\u0003".encodeToByteArray()
+
+    @Test fun aServerRestartedWithTheSameKeyIsRejoinedOnItsMeowAgain() {
+        LocalRelay().use { relay ->
+            RestartableServer(relay, echo).use { restartable ->
+                val client = TailcatClient.connect(restartable.address, ClientConfiguration(testOnlyPlaintextDERP = true, relayFirst = true))
+                try {
+                    client.dialTCP(80).let { try { exchange(it, "before the restart") } finally { it.close() } }
+                    restartable.restart()
+                    eventually("The restarted server is on the relay") { relay.connected == 2 }
+                    val restarted = System.nanoTime()
+                    val connection = client.dialTCP(80, 10_000)
+                    try { exchange(connection, "after the restart") } finally { connection.close() }
+                    val millis = (System.nanoTime() - restarted) / 1_000_000
+                    println("RESTART-REJOIN ${millis}ms")
+                    assertTrue(relay.sourcedPackets.any { it.first == restartable.server.publicKey && it.second.contentEquals(meowAgain) }, "The server says it has no session")
+                    assertTrue(millis < 3000, "Rejoined on the server's answer, not after the flow's timeouts: ${millis}ms")
+                    assertTrue(relay.sourcedPackets.count { it.first == client.publicKey && it.second.startsWith("meow\u0001".encodeToByteArray()) } >= 2,
+                        "The client meowed again")
+                } finally { client.close() }
+            }
+        }
+    }
+
     @Test fun realDerpMarkerBarrierPreservesPriorityAndAllowsRekeyControlAndOtherPeers() {
         LocalRelay().use { fixture ->
             val identity = NodePrivateKey.generate()
