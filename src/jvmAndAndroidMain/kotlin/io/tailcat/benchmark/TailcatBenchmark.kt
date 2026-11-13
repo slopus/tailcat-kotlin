@@ -308,7 +308,7 @@ class TailcatBenchmark(private val output: (String) -> Unit = ::println) : AutoC
                 stage = "recovery"
                 result["pathBeforeRecovery"] = route(instance)
                 val recoveryStart = now()
-                instance.notifyNetworkChanged()
+                instance.resetNetworkPaths()
                 result["pathAfterNotification"] = route(instance)
                 // Observe independently of TCP retransmission/echo completion, after the old route is cleared.
                 recoveryDeadline = now() + TimeUnit.SECONDS.toNanos(15)

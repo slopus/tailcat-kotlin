@@ -34,6 +34,9 @@ internal class NetworkTransport(
         var advertisedEndpoints: Set<Endpoint>? = null
         var authenticated = false
         var resetMarker: Long? = null
+        // A check (wake): unless a Pong arrives after checkSince, by checkBy the direct route is dropped.
+        var checkSince = 0L
+        var checkBy = 0L
     }
     private data class Probe(val peer: NodePublicKey, val endpoint: Endpoint, val sent: Long)
     private data class Event(val key: NodePublicKey?, val endpoint: Endpoint?, val packet: ByteArray, val generation: Long? = null)
@@ -139,7 +142,8 @@ internal class NetworkTransport(
                     changed
                 } else false
             }
-            if (changed) { networkChanged(id); continue }
+            // New addresses are advertised; what still answers is kept. Only a socket failure rebinds.
+            if (changed) { try { recheck(2000) } catch (_: TailcatClosedException) { return }; continue }
             if (lock.withLock { resolvedGeneration != id }) {
                 for (node in nodes.filter { it.stunPort >= 0 }.take(16)) {
                     if (!current(id)) break
@@ -185,6 +189,10 @@ internal class NetworkTransport(
                 }
                 val now = environment.now()
                 relay.tick(now)
+                for ((key, peer) in peers) if (peer.checkBy != 0L && now >= peer.checkBy) {
+                    if (peer.direct != null && peer.verified < peer.checkSince) { peer.direct = null; markReset(key, peer) }
+                    peer.checkBy = 0
+                }
                 if (now - lastMaintenance >= 1000) { lastMaintenance = now; maintain(now) }
                 // Service coalesced endpoint changes at their deadline, not the next one-second maintenance tick.
                 if (probeBudget > 0 || now - probeBudgetAt >= 1000) {
@@ -294,6 +302,27 @@ internal class NetworkTransport(
     fun invalidate(key: NodePublicKey) {
         lock.withLock { peers[key]?.let { if (it.direct != null) { it.direct = null; markReset(key, it) } }; probes.entries.removeAll { it.value.peer == key } }
     }
+    /**
+     * After a suspension or a network change: every way to every peer is
+     * checked and only what doesn't answer within [deadlineMillis] is
+     * replaced. The relay is pinged and reconnected only if silent; the
+     * direct route is probed first and kept if it answers, every other
+     * candidate is probed, addresses are advertised again and STUN asked
+     * again. Sockets and sessions stay.
+     */
+    fun recheck(deadlineMillis: Long = 2000) {
+        lock.withLock {
+            if (closed) throw TailcatClosedException()
+            val now = environment.now()
+            for ((key, peer) in peers) {
+                peer.direct?.let { peer.checkSince = now; peer.checkBy = now + deadlineMillis }
+                peer.lastCall = -100_000; invite(key)
+                requestProbe(key, listOfNotNull(peer.direct))
+            }
+            lastStun = -100_000; discoveryRequested = true; lock.signalAll()
+        }
+        relay.check(deadlineMillis)
+    }
     /** Coalesce requests into the existing maintenance/discovery workers, retaining the live route. */
     fun retryDirect(key: NodePublicKey? = null) {
         lock.withLock {
@@ -304,6 +333,7 @@ internal class NetworkTransport(
             discoveryRequested = true; lock.signalAll()
         }
     }
+    /** Forced reset: old candidates go, UDP rebinds and DERP reconnects. Only for sockets known unusable; a network change is [recheck]. */
     fun networkChanged() {
         lock.withLock { if (closed) throw TailcatClosedException() }
         networkChanged(null)

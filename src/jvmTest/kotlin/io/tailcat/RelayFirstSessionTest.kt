@@ -17,6 +17,8 @@ import kotlin.test.*
 class RelayFirstSessionTest {
     private class LocalRelay : AutoCloseable {
         private class Session(val socket: Socket) {
+            /** A black hole: frames are read and dropped, nothing goes out, as on a connection that died silently. */
+            @Volatile var silent = false
             fun read(): DerpFrame {
                 val header = exact(5)
                 val length = header.be32(1)
@@ -70,6 +72,7 @@ class RelayFirstSessionTest {
                 connections.incrementAndGet()
                 while (true) {
                     val frame = session.read()
+                    if (session.silent) continue
                     when (frame.type) {
                         4 -> {
                             val destination = NodePublicKey(frame.payload.copyOfRange(0, 32))
@@ -77,7 +80,7 @@ class RelayFirstSessionTest {
                             packets.add(packet)
                             sourcedPackets.add(client to packet)
                             if (allowDiscovery && client != blockedDiscoverySource || !packet.startsWith(Discovery.magic)) {
-                                try { sessions[destination]?.write(DerpFrame(5, client.raw + packet)) } catch (_: Exception) { }
+                                try { sessions[destination]?.takeUnless { it.silent }?.write(DerpFrame(5, client.raw + packet)) } catch (_: Exception) { }
                             }
                         }
                         0x12 -> session.write(DerpFrame(0x13, frame.payload))
@@ -94,6 +97,7 @@ class RelayFirstSessionTest {
             checkNotNull(sessions[destination]).write(DerpFrame(5, source.raw + packet))
         }
         fun disconnectAll() { for (socket in sockets) socket.close() }
+        fun silence(key: NodePublicKey) { checkNotNull(sessions[key]).silent = true }
         override fun close() { listener.close(); disconnectAll() }
     }
     private fun eventually(message: String, predicate: () -> Boolean) {
@@ -153,7 +157,7 @@ class RelayFirstSessionTest {
                     repeat(20) { exchange(stream2, "second isolated payload $it") }
                     worker.join(15_000); assertFalse(worker.isAlive); failure.get()?.let { throw it }
                     val secondInitiations = relay.sourcedPackets.count { it.first == second.publicKey && WireGuard.packetType(it.second) == 1 }
-                    first.notifyNetworkChanged()
+                    first.resetNetworkPaths()
                     exchange(stream2, "second session unaffected by first network reset")
                     exchange(stream1, "first session recovers on its own connection")
                     assertEquals(secondInitiations, relay.sourcedPackets.count { it.first == second.publicKey && WireGuard.packetType(it.second) == 1 })
@@ -249,7 +253,7 @@ class RelayFirstSessionTest {
                         assertTrue(client.path is ConnectionPath.Direct)
 
                         relay.allowDiscovery = false
-                        client.notifyNetworkChanged(); server.notifyNetworkChanged()
+                        client.resetNetworkPaths(); server.resetNetworkPaths()
                         assertEquals(ConnectionPath.Relay, client.path)
                         exchange(connection, "same stream after network reset over recovered relay")
                         relay.allowDiscovery = true
@@ -288,7 +292,7 @@ class RelayFirstSessionTest {
                     relay.allowDiscovery = false
                     val resetAt = System.nanoTime()
                     // Do not reset the server: it still has the old, recently validated client port.
-                    client.notifyNetworkChanged()
+                    client.resetNetworkPaths()
                     exchange(connection, "same stream after only the client changed network")
                     assertTrue(System.nanoTime() - resetAt < TimeUnit.SECONDS.toNanos(5), "Recovery must not wait for discovery or the ten-second maintenance probe")
                     assertEquals(ConnectionPath.Relay, server.path(client.publicKey))
@@ -337,14 +341,14 @@ class RelayFirstSessionTest {
                     // Only server advertisements pass: the server learns the client's new port from Ping,
                     // not a changed CMM. The encrypted marker must keep the existing stream usable.
                     relay.blockedDiscoverySource = client.publicKey
-                    client.notifyNetworkChanged(); server.retryDirect()
+                    client.resetNetworkPaths(); server.retryDirect()
                     exchange(connection, "first asymmetric reset")
                     eventually("First reset revalidates without the client's changed advertisement") {
                         server.path(client.publicKey) is ConnectionPath.Direct && server.path(client.publicKey) != oldReturn
                     }
                     relay.allowDiscovery = false
                     val secondReset = System.nanoTime()
-                    client.notifyNetworkChanged()
+                    client.resetNetworkPaths()
                     exchange(connection, "second immediate reset, with all discovery withheld")
                     val recoveryMillis = (System.nanoTime() - secondReset) / 1_000_000
                     println("SECOND-RESET-RECOVERY ${recoveryMillis}ms")
@@ -355,6 +359,59 @@ class RelayFirstSessionTest {
                     eventually("Direct restores after discovery is allowed again") { client.path is ConnectionPath.Direct && server.path(client.publicKey) is ConnectionPath.Direct }
                     exchange(connection, "same stream after both resets")
                     assertEquals(1, relay.packets.count { WireGuard.packetType(it) == 1 })
+                } finally { connection.close() }
+            } finally { client.close(); server.close() }
+        }
+    }
+
+    @Test fun wakeAndNetworkChangeKeepTheRelayAndRouteThatAnswer() {
+        LocalRelay().use { relay ->
+            val server = TailcatServer(ServerConfiguration(region = relay.region, testOnlyPlaintextDERP = true,
+                relayFirst = true, onTCP = { echo }))
+            val client = TailcatClient.connect(server.start(), ClientConfiguration(testOnlyPlaintextDERP = true, relayFirst = true))
+            try {
+                val connection = client.dialTCP(80)
+                try {
+                    exchange(connection, "initial relay stream")
+                    val connections = relay.connections.get()
+                    client.wake()
+                    Thread.sleep(2500)
+                    exchange(connection, "same stream after waking on a live relay")
+                    assertEquals(connections, relay.connections.get(), "An answering relay is kept")
+                    relay.allowDiscovery = true
+                    client.retryDirect(); server.retryDirect()
+                    eventually("Direct paths") { client.path is ConnectionPath.Direct && server.path(client.publicKey) is ConnectionPath.Direct }
+                    client.notifyNetworkChanged()
+                    Thread.sleep(2500)
+                    exchange(connection, "same stream after a network change that broke nothing")
+                    // Every interface of the server answers; any of them may be selected.
+                    assertTrue(client.path is ConnectionPath.Direct, "A direct route that answers is kept")
+                    assertEquals(connections, relay.connections.get(), "So is the relay")
+                    assertEquals(1, relay.packets.count { WireGuard.packetType(it) == 1 }, "And the session")
+                } finally { connection.close() }
+            } finally { client.close(); server.close() }
+        }
+    }
+
+    @Test fun wakeReplacesASilentRelayWithinItsDeadlineAndKeepsTheSession() {
+        LocalRelay().use { relay ->
+            val server = TailcatServer(ServerConfiguration(region = relay.region, testOnlyPlaintextDERP = true,
+                relayFirst = true, onTCP = { echo }))
+            val client = TailcatClient.connect(server.start(), ClientConfiguration(testOnlyPlaintextDERP = true, relayFirst = true))
+            try {
+                val connection = client.dialTCP(80)
+                try {
+                    exchange(connection, "initial relay stream")
+                    val connections = relay.connections.get()
+                    relay.silence(client.publicKey)
+                    val woke = System.nanoTime()
+                    client.wake()
+                    eventually("The silent relay is replaced") { relay.connections.get() > connections }
+                    val millis = (System.nanoTime() - woke) / 1_000_000
+                    println("SILENT-RELAY-RECOVERY ${millis}ms")
+                    assertTrue(millis in 1900..3000, "Replaced at the two-second deadline, not the 120-second one: ${millis}ms")
+                    exchange(connection, "same stream once the silent relay is replaced")
+                    assertEquals(1, relay.packets.count { WireGuard.packetType(it) == 1 }, "The session is kept")
                 } finally { connection.close() }
             } finally { client.close(); server.close() }
         }

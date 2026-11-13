@@ -171,7 +171,8 @@ val client = TailcatClient.connect(address, ClientConfiguration(relayFirst = tru
 client.retryDirect()                  // Background retry; keeps a healthy current path.
 server.retryDirect(client.publicKey)  // One peer, or omit the key for every peer.
 
-client.notifyNetworkChanged()         // Invalidate old paths, rebind UDP, reconnect DERP.
+client.wake()                         // Back from a suspension: check everything, replace what's dead.
+client.notifyNetworkChanged()         // The same check after a network change.
 server.notifyNetworkChanged()
 ```
 
@@ -194,10 +195,16 @@ interoperates with a default-mode endpoint. `client.path` and `server.path(key)`
 report the selected outbound route; `Relay` is not a relay-health guarantee.
 
 `retryDirect()` is non-blocking and coalesced: it does not tear down a working
-direct path, reconnect DERP or create a new session. `notifyNetworkChanged()`
-invalidates old endpoint/probe generations, closes and rebinds UDP sockets,
-reconnects DERP, and rediscovers in the background. `resetNetworkPaths()` remains
-an alias for this network-change operation. Requests after close fail with
+direct path, reconnect DERP or create a new session. A network change doesn't
+mean the old connections broke, so `notifyNetworkChanged()`, like `wake()` after
+a suspension, checks instead of tearing down: DERP is pinged and reconnected only
+if nothing comes back within two seconds, the selected direct route is probed
+first and dropped only if it doesn't answer by then, every other candidate is
+probed, and addresses and STUN are refreshed. UDP sockets and sessions stay; a
+socket that fails is rebound on its own. An address change found by the
+discovery worker runs the same check. `resetNetworkPaths()` is the forced reset:
+it invalidates old endpoint/probe generations, closes and rebinds UDP sockets,
+reconnects DERP, and rediscovers in the background. Requests after close fail with
 `TailcatClosedException`; closing cancels retries and prevents late discovery
 results from restoring a route.
 

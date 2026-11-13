@@ -75,9 +75,10 @@ class TailcatServer(private val configuration: ServerConfiguration = ServerConfi
     fun path(key: NodePublicKey): ConnectionPath = current().path(key)
     /** Request background probing without interrupting established sessions or validated paths. */
     fun retryDirect(key: NodePublicKey? = null) = current().retryDirect(key)
-    /** Notify an interface/route change: discard old candidates, rebind UDP and reconnect DERP. */
-    fun notifyNetworkChanged() = current().resetNetworkPaths()
-    fun resetNetworkPaths() = notifyNetworkChanged()
+    /** Notify an interface/route change: the relay and every path are checked, and only what doesn't answer is replaced. */
+    fun notifyNetworkChanged() = current().recheck()
+    /** Forced reset: discard old candidates, rebind UDP and reconnect DERP. Only when the sockets are known unusable. */
+    fun resetNetworkPaths() = current().resetNetworkPaths()
     fun close() { val old = lock.withLock { closed = true; engine }; old?.close() }
 }
 
@@ -93,9 +94,20 @@ class TailcatClient private constructor(private val engine: TailcatEngine) {
     fun openUDP(port: Int): TailcatUDPConnection = dialUDP(port)
     /** Request background probing without interrupting the current session or validated path. */
     fun retryDirect() = engine.retryDirect(serverAddress.serverPublicKey)
-    /** Notify an interface/route change, invalidating old paths without recreating this client. */
-    fun notifyNetworkChanged() = engine.resetNetworkPaths()
-    fun resetNetworkPaths() = notifyNetworkChanged()
+    /**
+     * Notify an interface/route change. A change doesn't mean the old
+     * connections broke: the relay and every path are checked, and only
+     * what doesn't answer is replaced, as in [wake].
+     */
+    fun notifyNetworkChanged() = engine.recheck()
+    /** Forced reset: discard old candidates, rebind UDP and reconnect DERP. Only when the sockets are known unusable. */
+    fun resetNetworkPaths() = engine.resetNetworkPaths()
+    /**
+     * Back from a suspension: ping the relay and probe every direct path,
+     * replacing only what doesn't answer within two seconds. The session
+     * and a route that still works are kept.
+     */
+    fun wake() = engine.recheck()
     fun close() = engine.close()
     companion object {
         fun connect(text: String, configuration: ClientConfiguration = ClientConfiguration()): TailcatClient = connect(TailcatAddress.parse(text), configuration)
@@ -223,6 +235,11 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
     fun path(key: NodePublicKey): ConnectionPath = network.path(key)
     fun resetNetworkPaths() = network.networkChanged()
     fun retryDirect(key: NodePublicKey?) = network.retryDirect(key)
+    fun recheck() {
+        network.recheck()
+        // An initiation sent before the check may have gone into a dead connection: the next tick sends another.
+        lock.withLock { peers.values.forEach { if (!it.wg.isEstablished) it.lastHandshake = -100_000 } }
+    }
     fun disconnect(key: NodePublicKey) = lock.withLock { removePeer(key) }
     private fun removePeer(key: NodePublicKey) {
         peers.remove(key)?.token = nextToken++
@@ -430,7 +447,10 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
                     peer.lastMeow = now; network.send(key, "meow\u0001".encodeToByteArray() + publicKey.raw + identity.discoPublicKey)
                     trace?.markOnce("meowQueued")
                 }
-                if (peer.acknowledged && (!peer.wg.isEstablished || peer.wg.needsRekey(now)) && now - peer.lastHandshake >= 5000 && (!server || peer.wg.isEstablished)) {
+                // Data waiting on a handshake retries it each second, not five: an initiation lost to a
+                // relay that died during a suspension otherwise holds that data for five seconds.
+                val spacing = if (!peer.wg.isEstablished && peer.pending.isNotEmpty()) 1000 else 5000
+                if (peer.acknowledged && (!peer.wg.isEstablished || peer.wg.needsRekey(now)) && now - peer.lastHandshake >= spacing && (!server || peer.wg.isEstablished)) {
                     peer.lastHandshake = now; sendPeerPacket(key, peer, peer.wg.initiate(now))
                     trace?.markOnce("wgInitiationQueued")
                 } else if (peer.wg.isEstablished && now - peer.lastSend >= 25_000) { sendPeerPacket(key, peer, peer.wg.encrypt(byteArrayOf(), now)); peer.lastSend = now }

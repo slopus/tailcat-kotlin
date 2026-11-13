@@ -21,6 +21,8 @@ internal interface NetworkRelay {
     fun discardResetMarker(key: NodePublicKey)
     fun tick(now: Long)
     fun reconnect()
+    /** Ping now; reconnect only if nothing comes back within [deadlineMillis]. A reconnect waiting out its backoff tries now. */
+    fun check(deadlineMillis: Long) {}
     fun close()
 }
 

@@ -55,6 +55,7 @@ class RelayFirstTransportTest {
         val writes = LinkedBlockingQueue<Pair<NodePublicKey, ByteArray>>()
         @Volatile override var connectionGeneration: Long? = null
         var reconnects = 0
+        var checks = 0
         var closed = false
         val resetBarriers = mutableSetOf<NodePublicKey>()
         val markers = mutableMapOf<NodePublicKey, ByteArray>()
@@ -66,6 +67,7 @@ class RelayFirstTransportTest {
         override fun discardResetMarker(key: NodePublicKey) { markers.remove(key); resetBarriers.remove(key) }
         override fun tick(now: Long) = Unit
         override fun reconnect() { reconnects++; connectionGeneration = null }
+        override fun check(deadlineMillis: Long) { checks++ }
         override fun close() { closed = true; connectionGeneration = null; markers.clear(); resetBarriers.clear() }
     }
     private class Fixture(val environment: Environment = Environment(), relayFirst: Boolean = true, stun: Boolean = false) {
@@ -263,14 +265,47 @@ class RelayFirstTransportTest {
         } finally { f.close() }
     }
 
-    @Test fun automaticAddressChangeRebindsAndCloseRejectsInFlightDiscovery() {
+    @Test fun recheckKeepsTheDirectRouteThatAnswersAndDropsOneThatDoesNot() {
+        for (answers in listOf(true, false)) {
+            val f = Fixture()
+            try {
+                val udp = validated(f)
+                f.advance(); udp.writes.clear()
+                f.transport.recheck(2000)
+                assertEquals(1, f.relay.checks)
+                val ping = assertNotNull(pingTo(f, udp, f.endpoint), "The direct route is probed at once")
+                assertTrue(f.relay.writes.any { Discovery.sourceKey(it.second) != null }, "Addresses are advertised again at once")
+                if (answers) {
+                    f.pong(udp, ping)
+                    udp.reads.add(RawDatagram(f.endpoint, byteArrayOf(91)))
+                    assertContentEquals(byteArrayOf(91), f.received.poll(1, TimeUnit.SECONDS))
+                }
+                f.advance(2001); barrier(f)
+                if (answers) assertEquals(ConnectionPath.Direct(f.endpoint.toString()), f.transport.path(f.remote.publicKey))
+                else {
+                    eventually { f.transport.path(f.remote.publicKey) == ConnectionPath.Relay }
+                    assertNotNull(f.transport.pendingResetMarker(f.remote.publicKey), "The peer is told to leave the dead route too")
+                }
+                assertEquals(0, f.relay.reconnects)
+                assertEquals(1, f.environment.sockets.size); assertFalse(udp.closed.get())
+            } finally { f.close() }
+        }
+    }
+
+    @Test fun automaticAddressChangeChecksWithoutRebindingAndCloseRejectsInFlightDiscovery() {
         val f = Fixture()
         try {
             val old = validated(f)
             f.environment.hosts = listOf("192.0.2.2")
-            f.transport.retryDirect()
-            eventually { old.closed.get() }
-            assertEquals(ConnectionPath.Relay, f.transport.path(f.remote.publicKey))
+            f.advance(); f.transport.retryDirect()
+            eventually { f.relay.checks == 1 }
+            f.pong(old, checkNotNull(pingTo(f, old, f.endpoint)))
+            old.reads.add(RawDatagram(f.endpoint, byteArrayOf(92)))
+            assertContentEquals(byteArrayOf(92), f.received.poll(1, TimeUnit.SECONDS))
+            f.advance(2001); barrier(f)
+            assertEquals(ConnectionPath.Direct(f.endpoint.toString()), f.transport.path(f.remote.publicKey))
+            assertFalse(old.closed.get()); assertEquals(1, f.environment.sockets.size)
+            assertEquals(0, f.relay.reconnects)
         } finally { f.close() }
         val gate = Gate()
         val blocked = Fixture(Environment().apply { bindGate = gate })
@@ -278,6 +313,7 @@ class RelayFirstTransportTest {
         blocked.transport.close()
         assertFailsWith<TailcatClosedException> { blocked.transport.retryDirect() }
         assertFailsWith<TailcatClosedException> { blocked.transport.networkChanged() }
+        assertFailsWith<TailcatClosedException> { blocked.transport.recheck() }
         assertFailsWith<TailcatClosedException> { blocked.transport.send(blocked.remote.publicKey, byteArrayOf()) }
         gate.release.countDown()
         eventually { blocked.environment.sockets.singleOrNull()?.closed?.get() == true }

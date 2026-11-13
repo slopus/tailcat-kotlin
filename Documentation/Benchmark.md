@@ -76,7 +76,7 @@ Each JSONL sample contains:
   do not call a five-sample percentile a reliable p95.
 - A concurrent writer/reader 256 KiB echo, checked byte-for-byte. The payload rate
   is `payloadBytes * 8 / elapsedSeconds`, **not** a doubled aggregate duplex rate.
-- An optional `notifyNetworkChanged()` followed by a numbered echo on the same
+- An optional `resetNetworkPaths()` followed by a numbered echo on the same
   stream, plus an independent post-notification observer for the new direct path,
   censored after 15 seconds even when the echo takes longer. This is a package API
   recovery exercise, not physical link loss or a DERP-server outage injection.

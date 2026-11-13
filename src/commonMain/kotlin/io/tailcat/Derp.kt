@@ -40,6 +40,10 @@ internal class DerpTransport(
     private var reader: PlatformThread? = null
     private var writer: PlatformThread? = null
     private var reconnectRequested = false
+    // A check: if nothing arrives after checkSince by checkBy, the stream is replaced.
+    private var checkSince = 0L
+    private var checkBy = 0L
+    private var lastTick = 0L
     // A failed advertised fast-start capability falls back on the next fresh connection only.
     private var fastStartAllowed = true
 
@@ -98,13 +102,39 @@ internal class DerpTransport(
         var close: PlatformStream? = null
         lock.withLock {
             if (closed) return
+            if (lastTick != 0L && now - lastTick > 5_000) {
+                // Ticks stopped: the process was frozen. The time away is no one's silence; a check decides.
+                val away = now - lastTick
+                phaseStarted += away; lastReceived = minOf(lastReceived + away, now - 1); lastPing = now
+                if (ready) {
+                    checkSince = now; checkBy = now + 2_000
+                    if (queue.size < 256) { queue.addLast(DerpFrame(0x12, secureRandom(8))); lock.signalAll() }
+                }
+            }
+            lastTick = now
             if ((!ready && now - phaseStarted > 25_000) || (ready && now - lastReceived > 120_000)) close = stream
+            if (checkBy != 0L && now >= checkBy) {
+                // A silent stream is replaced at once, without the failure backoff.
+                if (ready && lastReceived < checkSince) { close = stream; reconnectRequested = true }
+                checkBy = 0
+            }
             if (ready && now - lastPing >= 30_000) {
                 lastPing = now
                 if (queue.size < 256) { queue.addLast(DerpFrame(0x12, secureRandom(8))); lock.signalAll() }
             }
         }
         close?.close()
+    }
+    override fun check(deadlineMillis: Long) = lock.withLock {
+        if (closed) return@withLock
+        if (!ready) {
+            // Between connections: one waiting out its backoff tries now.
+            if (stream == null) { reconnectRequested = true; lock.signalAll() }
+            return@withLock
+        }
+        val now = monotonicMillis()
+        checkSince = now; checkBy = now + deadlineMillis
+        if (queue.size < 256) { queue.addLast(DerpFrame(0x12, secureRandom(8))); lock.signalAll() }
     }
     override fun reconnect() {
         val old = lock.withLock {
