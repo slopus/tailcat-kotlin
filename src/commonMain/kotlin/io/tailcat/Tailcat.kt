@@ -242,7 +242,8 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
     fun recheck() {
         network.recheck()
         // An initiation sent before the check may have gone into a dead connection: the next tick sends another.
-        lock.withLock { peers.values.forEach { if (!it.wg.isEstablished) it.lastHandshake = -100_000 } }
+        // The reset marker the check asked for goes now.
+        lock.withLock { peers.forEach { (key, peer) -> if (!peer.wg.isEstablished) peer.lastHandshake = -100_000; prepareResetMarker(key, peer) } }
     }
     fun disconnect(key: NodePublicKey) = lock.withLock { removePeer(key) }
     private fun removePeer(key: NodePublicKey) {

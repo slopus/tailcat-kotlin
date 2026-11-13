@@ -308,7 +308,9 @@ internal class NetworkTransport(
      * replaced. The relay is pinged and reconnected only if silent; the
      * direct route is probed first and kept if it answers, every other
      * candidate is probed, addresses are advertised again and STUN asked
-     * again. Sockets and sessions stay.
+     * again. A reset marker goes over the relay at once: a peer that
+     * restarted meanwhile answers it, not only after the direct check.
+     * Sockets and sessions stay.
      */
     fun recheck(deadlineMillis: Long = 2000) {
         lock.withLock {
@@ -318,6 +320,7 @@ internal class NetworkTransport(
                 peer.direct?.let { peer.checkSince = now; peer.checkBy = now + deadlineMillis }
                 peer.lastCall = -100_000; invite(key)
                 requestProbe(key, listOfNotNull(peer.direct))
+                markReset(key, peer)
             }
             lastStun = -100_000; discoveryRequested = true; lock.signalAll()
         }

@@ -485,6 +485,33 @@ class RelayFirstSessionTest {
         }
     }
 
+    @Test fun aWakeTellsTheRelayAtOnceAndSoMeetsARestartedServerBeforeTheDirectCheck() {
+        LocalRelay().use { relay ->
+            RestartableServer(relay, echo).use { restartable ->
+                val client = TailcatClient.connect(restartable.address, ClientConfiguration(testOnlyPlaintextDERP = true, relayFirst = true))
+                try {
+                    client.dialTCP(80).let { try { exchange(it, "before the restart") } finally { it.close() } }
+                    relay.allowDiscovery = true
+                    client.retryDirect(); restartable.server.retryDirect()
+                    eventually("Direct paths") { client.path is ConnectionPath.Direct && restartable.server.path(client.publicKey) is ConnectionPath.Direct }
+                    // The restarted server's invitation would say so too; this is about the marker alone.
+                    relay.allowDiscovery = false
+                    restartable.restart()
+                    eventually("The restarted server is on the relay") { relay.connected == 2 }
+                    fun meows() = relay.sourcedPackets.count { it.first == client.publicKey && it.second.startsWith("meow\u0001".encodeToByteArray()) }
+                    val before = meows()
+                    val woke = System.nanoTime()
+                    client.wake()
+                    eventually("The client rejoins") { meows() > before }
+                    val millis = (System.nanoTime() - woke) / 1_000_000
+                    println("WAKE-MARKER-REJOIN ${millis}ms")
+                    assertTrue(millis < 1000, "Rejoined on the marker's answer, not after the 2 s direct check: ${millis}ms")
+                    client.dialTCP(80, 10_000).let { try { exchange(it, "after the wake") } finally { it.close() } }
+                } finally { client.close() }
+            }
+        }
+    }
+
     @Test fun realDerpMarkerBarrierPreservesPriorityAndAllowsRekeyControlAndOtherPeers() {
         LocalRelay().use { fixture ->
             val identity = NodePrivateKey.generate()
