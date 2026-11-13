@@ -274,6 +274,20 @@ class IPStack(
         }
         return result
     }
+    /**
+     * The way to the peer was just replaced: what each flow sent into the old one was lost, and would
+     * wait out a timer that backed off meanwhile. Each flow still owed an acknowledgement sends its
+     * first unacknowledged segment again now, its timer back at the start.
+     */
+    fun resendOwed() = locked {
+        if (closed) return@locked
+        val now = monotonicMillis()
+        for (state in connections.values + closing.values) {
+            val first = state.segments.firstOrNull() ?: continue
+            if (state.finishedAt != null) continue
+            state.retransmitDelay = 500; first.sent = now; retransmit(state, first)
+        }
+    }
     private fun acknowledge(state: TCPState, ack: Long) {
         if (before(ack, state.sendUnacknowledged) || before(state.sendNext, ack)) return
         val advanced = distance(ack, state.sendUnacknowledged).toInt(); state.sendUnacknowledged = ack; state.duplicateACKs = 0; state.retransmitDelay = 500

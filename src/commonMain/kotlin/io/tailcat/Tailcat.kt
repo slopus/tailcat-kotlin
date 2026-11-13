@@ -288,6 +288,7 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
         val peer = peers[key] ?: run { if (server && event.relay) askToMeowAgain(key); return }
         val wasAuthenticated = peer.authenticated
         val now = monotonicMillis(); val result = peer.wg.receive(packet, now)
+        val rejoined = result.handshakeCompleted && peer.rejoining
         if (result.handshakeCompleted) { trace?.markOnce("wgEstablished"); peer.rejoining = false }
         result.response?.let { sendPeerPacket(key, peer, it); peer.lastSend = now }
         if (result.handshakeCompleted || WireGuard.packetType(packet) == 4) {
@@ -296,6 +297,9 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
             if (server && !peer.admitted && !peer.admissionPending) beginAdmission(key, peer)
         }
         if (result.handshakeCompleted) { flush(key, peer); lock.signalAll() }
+        // What went on the old session may be lost with it: resend it now rather than when each
+        // flow's backed-off timer comes round.
+        if (rejoined) stack.resendOwed()
         if (event.relay && wasAuthenticated && !result.handshakeCompleted && packet.size == 32 && WireGuard.packetType(packet) == 4) {
             // Empty transport is already a valid WireGuard packet. No new message type or crypto.
             // Only markers affect this history: newer direct data may overtake a queued relay marker.

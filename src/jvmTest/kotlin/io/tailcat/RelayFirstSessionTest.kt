@@ -425,8 +425,9 @@ class RelayFirstSessionTest {
         val address = server.start()
         private fun make() = TailcatServer(ServerConfiguration(privateKey = key, presharedKey = psk, region = relay.region,
             testOnlyPlaintextDERP = true, relayFirst = true, onTCP = { handler }))
-        fun restart() {
-            server.close()
+        fun restart() { stop(); start() }
+        fun stop() = server.close()
+        fun start() {
             server = make()
             check(server.start().encode() == address.encode())
         }
@@ -451,6 +452,34 @@ class RelayFirstSessionTest {
                     assertTrue(millis < 3000, "Rejoined on the server's answer, not after the flow's timeouts: ${millis}ms")
                     assertTrue(relay.sourcedPackets.count { it.first == client.publicKey && it.second.startsWith("meow\u0001".encodeToByteArray()) } >= 2,
                         "The client meowed again")
+                } finally { client.close() }
+            }
+        }
+    }
+
+    @Test fun aRejoinResendsWhatEachFlowOwesAtOnce() {
+        LocalRelay().use { relay ->
+            RestartableServer(relay, echo).use { restartable ->
+                val client = TailcatClient.connect(restartable.address, ClientConfiguration(testOnlyPlaintextDERP = true, relayFirst = true))
+                try {
+                    client.dialTCP(80).let { try { exchange(it, "before the restart") } finally { it.close() } }
+                    restartable.stop()
+                    // Its SYN goes nowhere and backs off: 0, 0.5, 1.5 and 3.5 s, then not until 7.5 s.
+                    val began = System.nanoTime()
+                    val owed = java.util.concurrent.atomic.AtomicReference<Any?>(null)
+                    val waiting = thread(isDaemon = true) {
+                        owed.set(try { client.dialTCP(80, 20_000).also { exchange(it, "owed since the restart"); it.close() } } catch (failure: Throwable) { failure })
+                    }
+                    Thread.sleep(4000)
+                    restartable.start()
+                    eventually("The restarted server is on the relay") { relay.connected == 2 }
+                    // A new flow meets the server's meow again, and the rejoin it starts makes a new session.
+                    client.dialTCP(80, 10_000).let { try { exchange(it, "after the restart") } finally { it.close() } }
+                    waiting.join(10_000)
+                    val millis = (System.nanoTime() - began) / 1_000_000
+                    println("REJOIN-RESEND ${millis}ms")
+                    assertTrue(owed.get() is TailcatConnection, "The owed flow got through: ${owed.get()}")
+                    assertTrue(millis < 6500, "Its SYN went again with the new session, not at 7.5 s: ${millis}ms")
                 } finally { client.close() }
             }
         }
