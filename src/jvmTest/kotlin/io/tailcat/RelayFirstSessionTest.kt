@@ -38,6 +38,8 @@ class RelayFirstSessionTest {
         @Volatile var allowDiscovery = false
         @Volatile var stallAuthentication = false
         @Volatile var blockedDiscoverySource: NodePublicKey? = null
+        /** WireGuard transport from this node goes nowhere; handshakes and meows still pass. */
+        @Volatile var droppedTransportSource: NodePublicKey? = null
         val region = DERPRegion(1, listOf(DERPNode("127.0.0.1", ipv4 = "127.0.0.1", derpPort = listener.localPort, stunPort = -1)))
         val connected: Int get() = sessions.size
         val openConnections: Int get() = sockets.size
@@ -79,6 +81,7 @@ class RelayFirstSessionTest {
                             val packet = frame.payload.copyOfRange(32, frame.payload.size)
                             packets.add(packet)
                             sourcedPackets.add(client to packet)
+                            if (client == droppedTransportSource && WireGuard.packetType(packet) == 4) continue
                             if (allowDiscovery && client != blockedDiscoverySource || !packet.startsWith(Discovery.magic)) {
                                 try { sessions[destination]?.takeUnless { it.silent }?.write(DerpFrame(5, client.raw + packet)) } catch (_: Exception) { }
                             }
@@ -418,13 +421,14 @@ class RelayFirstSessionTest {
     }
 
     /** A server restarted with the same key: same address, none of its sessions or admissions. */
-    private class RestartableServer(private val relay: LocalRelay, private val handler: TailcatTCPHandler) : AutoCloseable {
+    private class RestartableServer(private val relay: LocalRelay, private val handler: TailcatTCPHandler,
+                                    private val udp: TailcatUDPHandler? = null) : AutoCloseable {
         private val key = NodePrivateKey.generate()
         private val psk = PresharedKey.generate()
         @Volatile var server = make()
         val address = server.start()
         private fun make() = TailcatServer(ServerConfiguration(privateKey = key, presharedKey = psk, region = relay.region,
-            testOnlyPlaintextDERP = true, relayFirst = true, onTCP = { handler }))
+            testOnlyPlaintextDERP = true, relayFirst = true, onTCP = { handler }, onUDP = { udp }))
         fun restart() { stop(); start() }
         fun stop() = server.close()
         fun start() {
@@ -534,6 +538,58 @@ class RelayFirstSessionTest {
                     println("INVITE-REJOIN ${millis}ms")
                     assertTrue(millis < 1000, "Rejoined on the invitation: ${millis}ms")
                     client.dialTCP(80, 10_000).let { try { exchange(it, "after the invitation") } finally { it.close() } }
+                } finally { client.close() }
+            }
+        }
+    }
+
+    private fun meows(relay: LocalRelay, client: TailcatClient) =
+        relay.sourcedPackets.count { it.first == client.publicKey && it.second.startsWith("meow\u0001".encodeToByteArray()) }
+
+    @Test fun dataUnansweredFor15SecondsMeowsAndHandshakesAgain() {
+        LocalRelay().use { relay ->
+            RestartableServer(relay, echo).use { restartable ->
+                val client = TailcatClient.connect(restartable.address, ClientConfiguration(testOnlyPlaintextDERP = true, relayFirst = true))
+                try {
+                    val before = meows(relay, client)
+                    val initiations = relay.sourcedPackets.count { it.first == client.publicKey && WireGuard.packetType(it.second) == 1 }
+                    // A server that reads nothing we send and says nothing: no meow again, no TCP to time out.
+                    relay.droppedTransportSource = client.publicKey
+                    val flow = client.dialUDP(9)
+                    val sent = System.nanoTime()
+                    flow.send("unanswered".encodeToByteArray())
+                    val deadline = sent + TimeUnit.SECONDS.toNanos(20)
+                    while (meows(relay, client) == before) { check(System.nanoTime() < deadline) { "No rejoin" }; Thread.sleep(20) }
+                    val millis = (System.nanoTime() - sent) / 1_000_000
+                    println("UNANSWERED-REJOIN ${millis}ms")
+                    assertTrue(millis in 14_900..16_500, "Rejoined 15 s after the unanswered data: ${millis}ms")
+                    eventually("And handshook again") {
+                        relay.sourcedPackets.count { it.first == client.publicKey && WireGuard.packetType(it.second) == 1 } > initiations
+                    }
+                    relay.droppedTransportSource = null
+                    client.dialTCP(80, 10_000).let { try { exchange(it, "after the rejoin") } finally { it.close() } }
+                } finally { client.close() }
+            }
+        }
+    }
+
+    @Test fun dataReceivedIsAnsweredWithAPassiveKeepaliveWithin10Seconds() {
+        LocalRelay().use { relay ->
+            val reply: TailcatUDPHandler = { flow -> try { flow.send(flow.receive(10_000)); Thread.sleep(20_000) } finally { flow.close() } }
+            RestartableServer(relay, echo, reply).use { restartable ->
+                val client = TailcatClient.connect(restartable.address, ClientConfiguration(testOnlyPlaintextDERP = true, relayFirst = true))
+                try {
+                    val flow = client.dialUDP(9)
+                    flow.send("ping".encodeToByteArray())
+                    assertContentEquals("ping".encodeToByteArray(), flow.receive(10_000))
+                    val received = System.nanoTime()
+                    val already = relay.sourcedPackets.size
+                    fun keepalive() = relay.sourcedPackets.drop(already).any { it.first == client.publicKey && it.second.size == 32 && WireGuard.packetType(it.second) == 4 }
+                    val deadline = received + TimeUnit.SECONDS.toNanos(15)
+                    while (!keepalive()) { check(System.nanoTime() < deadline) { "No passive keepalive" }; Thread.sleep(20) }
+                    val millis = (System.nanoTime() - received) / 1_000_000
+                    println("PASSIVE-KEEPALIVE ${millis}ms")
+                    assertTrue(millis in 9_900..11_500, "Answered 10 s after the data, not at the 25 s keepalive: ${millis}ms")
                 } finally { client.close() }
             }
         }

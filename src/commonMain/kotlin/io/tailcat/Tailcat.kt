@@ -154,6 +154,10 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
         val resetCounters = linkedMapOf<Long, ULong>()
         /** Meowing and handshaking again on a session the server may have lost, until a new one is made. */
         var rejoining = false
+        /** When data first went out with nothing authenticated back since, counted from a wake. */
+        var sentSinceReceived: Long? = null
+        /** Data came in with nothing sent since: WireGuard's passive keepalive answers it. */
+        var receivedSinceSent: Long? = null
     }
     private sealed class Event {
         class Incoming(val key: NodePublicKey, val packet: ByteArray, val relay: Boolean) : Event()
@@ -249,8 +253,14 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
     fun recheck() {
         network.recheck()
         // An initiation sent before the check may have gone into a dead connection: the next tick sends another.
-        // The reset marker the check asked for goes now.
-        lock.withLock { peers.forEach { (key, peer) -> if (!peer.wg.isEstablished) peer.lastHandshake = -100_000; prepareResetMarker(key, peer) } }
+        // The reset marker the check asked for goes now. An answer due while suspended had no chance to come.
+        lock.withLock {
+            peers.forEach { (key, peer) ->
+                if (!peer.wg.isEstablished) peer.lastHandshake = -100_000
+                peer.sentSinceReceived = null
+                prepareResetMarker(key, peer)
+            }
+        }
     }
     fun disconnect(key: NodePublicKey) = lock.withLock { removePeer(key) }
     /** Advertise our endpoints to [key] before it has been admitted, as the Go server does to the clients it knows. */
@@ -298,9 +308,11 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
         val peer = peers[key] ?: run { if (server && event.relay) askToMeowAgain(key); return }
         val wasAuthenticated = peer.authenticated
         val now = monotonicMillis(); val result = peer.wg.receive(packet, now)
+        peer.sentSinceReceived = null
+        if (result.plaintext != null && peer.receivedSinceSent == null) peer.receivedSinceSent = now
         val rejoined = result.handshakeCompleted && peer.rejoining
         if (result.handshakeCompleted) { trace?.markOnce("wgEstablished"); peer.rejoining = false }
-        result.response?.let { sendPeerPacket(key, peer, it); peer.lastSend = now }
+        result.response?.let { sendPeerPacket(key, peer, it); peer.lastSend = now; peer.receivedSinceSent = null }
         if (result.handshakeCompleted || WireGuard.packetType(packet) == 4) {
             peer.authenticated = true; peer.lastReceived = now
             network.authenticated(key)
@@ -357,6 +369,7 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
         val peer = peers[address.serverPublicKey] ?: return
         if (server || !peer.acknowledged) return
         peer.acknowledged = false; peer.rejoining = true; peer.lastMeow = -100_000; peer.lastHandshake = -100_000
+        peer.sentSinceReceived = null
     }
     private fun beginAdmission(key: NodePublicKey, peer: Peer) {
         val hook = configuration.allowClient
@@ -404,14 +417,21 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
         if (packet.size < 40) return
         val key = if (server) peerKey(packet.copyOfRange(24, 40)) ?: return else address.serverPublicKey
         val peer = peers[key] ?: return
-        if (peer.wg.isEstablished) { sendPeerPacket(key, peer, peer.wg.encrypt(packet, monotonicMillis())); peer.lastSend = monotonicMillis() }
+        if (peer.wg.isEstablished) sendPayload(key, peer, packet)
         else if (peer.pendingBytes + packet.size <= 262144) { peer.pending.addLast(packet); peer.pendingBytes += packet.size }
     }
     private fun flush(key: NodePublicKey, peer: Peer) {
         while (peer.pending.isNotEmpty() && peer.wg.isEstablished) {
             val packet = peer.pending.removeFirst(); peer.pendingBytes -= packet.size
-            sendPeerPacket(key, peer, peer.wg.encrypt(packet, monotonicMillis())); peer.lastSend = monotonicMillis()
+            sendPayload(key, peer, packet)
         }
+    }
+    /** IP or, empty, a keepalive on the current session. */
+    private fun sendPayload(key: NodePublicKey, peer: Peer, packet: ByteArray) {
+        val now = monotonicMillis()
+        sendPeerPacket(key, peer, peer.wg.encrypt(packet, now))
+        peer.lastSend = now; peer.receivedSinceSent = null
+        if (packet.isNotEmpty() && peer.sentSinceReceived == null) peer.sentSinceReceived = now
     }
     private fun deliverServerIP(ip: ByteArray) {
         val destination = ip.copyOfRange(24, 40); val source = ip.copyOfRange(8, 24)
@@ -491,6 +511,10 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
             try {
                 peer.wg.maintenance(now)
                 prepareResetMarker(key, peer)
+                // As in WireGuard, data with nothing authenticated back for its keepalive and rekey timeouts,
+                // 15 s, starts a new handshake. A server restarted with the same key holds neither our session
+                // nor our admission, so the handshake goes with a meow, as when connecting.
+                if (!server && peer.sentSinceReceived?.let { now - it >= 15_000 } == true) rejoin()
                 if (!server && !peer.acknowledged && now - peer.lastMeow >= 1000) {
                     peer.lastMeow = now; network.send(key, "meow\u0001".encodeToByteArray() + publicKey.raw + identity.discoPublicKey)
                     trace?.markOnce("meowQueued")
@@ -502,7 +526,10 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
                 if (peer.acknowledged && (!peer.wg.isEstablished || peer.rejoining || peer.wg.needsRekey(now)) && now - peer.lastHandshake >= spacing && (!server || peer.wg.isEstablished)) {
                     peer.lastHandshake = now; sendPeerPacket(key, peer, peer.wg.initiate(now))
                     trace?.markOnce("wgInitiationQueued")
-                } else if (peer.wg.isEstablished && now - peer.lastSend >= 25_000) { sendPeerPacket(key, peer, peer.wg.encrypt(byteArrayOf(), now)); peer.lastSend = now }
+                } else if (peer.wg.isEstablished && peer.receivedSinceSent?.let { now - it >= 10_000 } == true) {
+                    // WireGuard's passive keepalive: data is answered within its keepalive timeout.
+                    sendPayload(key, peer, byteArrayOf())
+                } else if (peer.wg.isEstablished && now - peer.lastSend >= 25_000) sendPayload(key, peer, byteArrayOf())
             } catch (_: Exception) { network.invalidate(key) }
         }
         for ((key, activity) in targetActivity.toMap()) {
