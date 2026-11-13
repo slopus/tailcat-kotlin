@@ -595,6 +595,55 @@ class RelayFirstSessionTest {
         }
     }
 
+    @Test fun aFlowUnacknowledgedFor5SecondsHandshakesAgainWhileTheServerStillSends() {
+        LocalRelay().use { relay ->
+            // Port 81 writes forever: the server keeps sending, so something always comes back.
+            val handler: TailcatTCPHandler = { connection ->
+                if (connection.localPort == 81) try { while (true) { connection.write("tick".encodeToByteArray(), timeoutMillis = 60_000); Thread.sleep(100) } } catch (_: Exception) { connection.close() }
+                else echo(connection)
+            }
+            RestartableServer(relay, handler).use { restartable ->
+                val client = TailcatClient.connect(restartable.address, ClientConfiguration(testOnlyPlaintextDERP = true, relayFirst = true))
+                try {
+                    val talking = client.dialTCP(81)
+                    val reader = thread(isDaemon = true) { try { while (talking.read(4096, 30_000).isNotEmpty()) { } } catch (_: Exception) { } }
+                    val connection = client.dialTCP(80)
+                    exchange(connection, "before the server stops reading")
+                    val before = meows(relay, client)
+                    relay.droppedTransportSource = client.publicKey
+                    val wrote = System.nanoTime()
+                    thread(isDaemon = true) { try { connection.write("unacknowledged".encodeToByteArray(), timeoutMillis = 30_000) } catch (_: Exception) { } }
+                    val deadline = wrote + TimeUnit.SECONDS.toNanos(12)
+                    while (meows(relay, client) == before) { check(System.nanoTime() < deadline) { "No rejoin" }; Thread.sleep(20) }
+                    val millis = (System.nanoTime() - wrote) / 1_000_000
+                    println("OWED-REJOIN ${millis}ms")
+                    assertTrue(millis in 5_000..7_000, "5 s after its first retransmission: ${millis}ms")
+                    relay.droppedTransportSource = null
+                    talking.close(); reader.join(5000); connection.close()
+                } finally { client.close() }
+            }
+        }
+    }
+
+    @Test fun theTickThatEndsASuspensionDoesNotCountItAsUnanswered() {
+        LocalRelay().use { relay ->
+            RestartableServer(relay, echo).use { restartable ->
+                val client = TailcatClient.connect(restartable.address, ClientConfiguration(testOnlyPlaintextDERP = true, relayFirst = true))
+                try {
+                    val before = meows(relay, client)
+                    relay.droppedTransportSource = client.publicKey
+                    val sent = relay.sourcedPackets.size
+                    client.dialUDP(9).send("sent just before a suspension".encodeToByteArray())
+                    eventually("Sent") { relay.sourcedPackets.drop(sent).any { it.first == client.publicKey && WireGuard.packetType(it.second) == 4 } }
+                    // The timer's first tick may come before the wake: 20 s away is not 20 s unanswered.
+                    client.resumeForTesting(20_000)
+                    Thread.sleep(1000)
+                    assertEquals(before, meows(relay, client), "No rejoin for the time away")
+                } finally { client.close() }
+            }
+        }
+    }
+
     @Test fun realDerpMarkerBarrierPreservesPriorityAndAllowsRekeyControlAndOtherPeers() {
         LocalRelay().use { fixture ->
             val identity = NodePrivateKey.generate()

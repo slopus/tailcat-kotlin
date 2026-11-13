@@ -109,6 +109,7 @@ class TailcatClient private constructor(private val engine: TailcatEngine) {
      * and a route that still works are kept.
      */
     fun wake() = engine.recheck()
+    internal fun resumeForTesting(millis: Long) = engine.resumeForTesting(millis)
     fun close() = engine.close()
     companion object {
         fun connect(text: String, configuration: ClientConfiguration = ClientConfiguration()): TailcatClient = connect(TailcatAddress.parse(text), configuration)
@@ -186,6 +187,9 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
     private var nextToken = 1L
     private var admissionJobs = 0
     private var handlerJobs = 0
+    private var lastTick = 0L
+    /** When a tick first found a flow retransmitting, unanswered since. */
+    private var owedSince: Long? = null
     private val network = NetworkTransport(identity, address.regions.first().nodes, configuration.testOnlyPlaintextDERP,
         relayFirst = configuration.relayFirst, trace = trace, restarted = { key -> try { offer(Event.Restarted(key)) } catch (_: Exception) { } }) {
         key, packet, relay -> offer(Event.Incoming(key, packet, relay))
@@ -253,14 +257,19 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
     fun recheck() {
         network.recheck()
         // An initiation sent before the check may have gone into a dead connection: the next tick sends another.
-        // The reset marker the check asked for goes now. An answer due while suspended had no chance to come.
+        // The reset marker the check asked for goes now.
         lock.withLock {
-            peers.forEach { (key, peer) ->
-                if (!peer.wg.isEstablished) peer.lastHandshake = -100_000
-                peer.sentSinceReceived = null
-                prepareResetMarker(key, peer)
-            }
+            forgetUnanswered()
+            peers.forEach { (key, peer) -> if (!peer.wg.isEstablished) peer.lastHandshake = -100_000; prepareResetMarker(key, peer) }
         }
+    }
+    /** An answer due while suspended had no chance to come. */
+    private fun forgetUnanswered() { peers.values.forEach { it.sentSinceReceived = null }; owedSince = null }
+    /** The first tick after a suspension of [millis], with what was sent that much longer unanswered. */
+    internal fun resumeForTesting(millis: Long) = lock.withLock {
+        lastTick -= millis; owedSince = owedSince?.minus(millis)
+        peers.values.forEach { peer -> peer.sentSinceReceived = peer.sentSinceReceived?.minus(millis) }
+        tick(monotonicMillis())
     }
     fun disconnect(key: NodePublicKey) = lock.withLock { removePeer(key) }
     /** Advertise our endpoints to [key] before it has been admitted, as the Go server does to the clients it knows. */
@@ -369,7 +378,7 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
         val peer = peers[address.serverPublicKey] ?: return
         if (server || !peer.acknowledged) return
         peer.acknowledged = false; peer.rejoining = true; peer.lastMeow = -100_000; peer.lastHandshake = -100_000
-        peer.sentSinceReceived = null
+        peer.sentSinceReceived = null; owedSince = null
     }
     private fun beginAdmission(key: NodePublicKey, peer: Peer) {
         val hook = configuration.allowClient
@@ -504,7 +513,13 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
         startThread("tailcat-udp-handler") { try { handler!!(connection) } catch (_: Exception) { connection.close() } finally { lock.withLock { handlerJobs-- } } }
     }
     private fun tick(now: Long) {
+        // Suspended: this tick may come before the wake, and nothing could have answered.
+        if (lastTick != 0L && now - lastTick >= 5000) forgetUnanswered()
+        lastTick = now
         stack.tick(now); targets.values.forEach { it.tick(now) }
+        // Packets from the server don't show that it reads ours: a flow whose data has gone unacknowledged
+        // for 5 s handshakes again too. An idle client never does.
+        if (!server) { if (stack.retransmitting) owedSince = owedSince ?: now else owedSince = null }
         selected.entries.removeAll { now - it.value.time > 60_000 }
         for ((key, peer) in peers.toMap()) {
             if ((!peer.authenticated && now - peer.created > 30_000) || (server && peer.authenticated && now - peer.lastReceived > 300_000)) { removePeer(key); continue }
@@ -514,7 +529,8 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
                 // As in WireGuard, data with nothing authenticated back for its keepalive and rekey timeouts,
                 // 15 s, starts a new handshake. A server restarted with the same key holds neither our session
                 // nor our admission, so the handshake goes with a meow, as when connecting.
-                if (!server && peer.sentSinceReceived?.let { now - it >= 15_000 } == true) rejoin()
+                if (!server && peer.acknowledged && !peer.rejoining &&
+                    (peer.sentSinceReceived?.let { now - it >= 15_000 } == true || owedSince?.let { now - it >= 5000 } == true)) rejoin()
                 if (!server && !peer.acknowledged && now - peer.lastMeow >= 1000) {
                     peer.lastMeow = now; network.send(key, "meow\u0001".encodeToByteArray() + publicKey.raw + identity.discoPublicKey)
                     trace?.markOnce("meowQueued")

@@ -288,6 +288,10 @@ class IPStack(
             state.retransmitDelay = 500; first.sent = now; retransmit(state, first)
         }
     }
+    /** Some flow has had to send its first unacknowledged segment again, and still waits. */
+    val retransmitting: Boolean get() = locked {
+        (connections.values.asSequence() + closing.values.asSequence()).any { it.finishedAt == null && (it.segments.firstOrNull()?.retries ?: 0) > 0 }
+    }
     private fun acknowledge(state: TCPState, ack: Long) {
         if (before(ack, state.sendUnacknowledged) || before(state.sendNext, ack)) return
         val advanced = distance(ack, state.sendUnacknowledged).toInt(); state.sendUnacknowledged = ack; state.duplicateACKs = 0; state.retransmitDelay = 500
