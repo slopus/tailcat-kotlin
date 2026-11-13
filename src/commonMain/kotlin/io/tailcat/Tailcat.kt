@@ -72,6 +72,7 @@ class TailcatServer(private val configuration: ServerConfiguration = ServerConfi
     fun peerKey(connection: TailcatConnection): NodePublicKey? = connection.peer ?: current().peerKey(connection.remoteAddress)
     fun peerKey(connection: TailcatUDPConnection): NodePublicKey? = connection.peer ?: current().peerKey(connection.remoteAddress)
     fun disconnectClient(key: NodePublicKey) = current().disconnect(key)
+    internal fun inviteForTesting(key: NodePublicKey, disco: ByteArray) = current().inviteForTesting(key, disco)
     fun path(key: NodePublicKey): ConnectionPath = current().path(key)
     /** Request background probing without interrupting established sessions or validated paths. */
     fun retryDirect(key: NodePublicKey? = null) = current().retryDirect(key)
@@ -158,6 +159,7 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
         class Incoming(val key: NodePublicKey, val packet: ByteArray, val relay: Boolean) : Event()
         class Outgoing(val packet: ByteArray) : Event()
         class Admitted(val key: NodePublicKey, val token: Long, val allowed: Boolean) : Event()
+        class Restarted(val key: NodePublicKey) : Event()
     }
     private data class ServiceKey(val destination: BytesKey, val port: Int, val udp: Boolean)
     private data class FlowKey(val destination: BytesKey, val source: BytesKey, val localPort: Int, val remotePort: Int)
@@ -181,7 +183,9 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
     private var admissionJobs = 0
     private var handlerJobs = 0
     private val network = NetworkTransport(identity, address.regions.first().nodes, configuration.testOnlyPlaintextDERP,
-        relayFirst = configuration.relayFirst, trace = trace) { key, packet, relay -> offer(Event.Incoming(key, packet, relay)) }
+        relayFirst = configuration.relayFirst, trace = trace, restarted = { key -> try { offer(Event.Restarted(key)) } catch (_: Exception) { } }) {
+        key, packet, relay -> offer(Event.Incoming(key, packet, relay))
+    }
     private val stack = newStack(publicKey.address)
     private fun newStack(address: ByteArray): IPStack = IPStack(address, { offer(Event.Outgoing(it)) },
         if (server) null else this.address.serverPublicKey, { raw -> peerKey(raw) })
@@ -209,7 +213,10 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
             lock.withLock {
                 if (closed) return
                 for (event in batch) try {
-                    when (event) { is Event.Incoming -> receive(event); is Event.Outgoing -> sendIP(event.packet); is Event.Admitted -> completeAdmission(event) }
+                    when (event) { is Event.Incoming -> receive(event); is Event.Outgoing -> sendIP(event.packet); is Event.Admitted -> completeAdmission(event)
+                        // A server back on new ports holds neither our session nor our admission: nothing sent
+                        // on the old session can be answered, so rejoin now rather than wait for its silence.
+                        is Event.Restarted -> if (event.key == address.serverPublicKey) rejoin() }
                 } catch (_: Exception) { }
                 tick(monotonicMillis())
             }
@@ -246,6 +253,8 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
         lock.withLock { peers.forEach { (key, peer) -> if (!peer.wg.isEstablished) peer.lastHandshake = -100_000; prepareResetMarker(key, peer) } }
     }
     fun disconnect(key: NodePublicKey) = lock.withLock { removePeer(key) }
+    /** Advertise our endpoints to [key] before it has been admitted, as the Go server does to the clients it knows. */
+    internal fun inviteForTesting(key: NodePublicKey, disco: ByteArray) { network.configurePeer(key, disco); network.authenticated(key) }
     private fun removePeer(key: NodePublicKey) {
         peers.remove(key)?.token = nextToken++
         network.removePeer(key); bindingsLock.withLock { bindings.remove(BytesKey(key.address)) }

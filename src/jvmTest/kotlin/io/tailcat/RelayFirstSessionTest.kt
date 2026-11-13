@@ -512,6 +512,33 @@ class RelayFirstSessionTest {
         }
     }
 
+    @Test fun aRestartedServersInvitationOnNewPortsIsRejoinedAtOnce() {
+        LocalRelay().use { relay ->
+            RestartableServer(relay, echo).use { restartable ->
+                val client = TailcatClient.connect(restartable.address, ClientConfiguration(testOnlyPlaintextDERP = true, relayFirst = true))
+                try {
+                    client.dialTCP(80).let { try { exchange(it, "before the restart") } finally { it.close() } }
+                    relay.allowDiscovery = true
+                    client.retryDirect(); restartable.server.retryDirect()
+                    eventually("Direct paths") { client.path is ConnectionPath.Direct && restartable.server.path(client.publicKey) is ConnectionPath.Direct }
+                    restartable.restart()
+                    eventually("The restarted server is on the relay") { relay.connected == 2 }
+                    fun meows() = relay.sourcedPackets.count { it.first == client.publicKey && it.second.startsWith("meow\u0001".encodeToByteArray()) }
+                    val before = meows()
+                    val disco = relay.sourcedPackets.first { it.first == client.publicKey && it.second.startsWith("meow\u0001".encodeToByteArray()) }.second.copyOfRange(37, 69)
+                    // The client is idle: nothing it sends could draw a meow again.
+                    val invited = System.nanoTime()
+                    restartable.server.inviteForTesting(client.publicKey, disco)
+                    eventually("The client rejoins") { meows() > before }
+                    val millis = (System.nanoTime() - invited) / 1_000_000
+                    println("INVITE-REJOIN ${millis}ms")
+                    assertTrue(millis < 1000, "Rejoined on the invitation: ${millis}ms")
+                    client.dialTCP(80, 10_000).let { try { exchange(it, "after the invitation") } finally { it.close() } }
+                } finally { client.close() }
+            }
+        }
+    }
+
     @Test fun realDerpMarkerBarrierPreservesPriorityAndAllowsRekeyControlAndOtherPeers() {
         LocalRelay().use { fixture ->
             val identity = NodePrivateKey.generate()

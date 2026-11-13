@@ -76,10 +76,12 @@ class RelayFirstTransportTest {
         val endpoint = Endpoint("198.51.100.2", 4000)
         lateinit var relay: Relay
         val received = LinkedBlockingQueue<ByteArray>()
+        val restarted = LinkedBlockingQueue<NodePublicKey>()
         val transport = NetworkTransport(local, listOf(DERPNode("fixture", stunPort = if (stun) 3478 else -1)),
-            relayFirst = relayFirst, environment = environment, relayFactory = { Relay(it).also { r -> relay = r } }) { _, packet, _ -> received.add(packet) }
+            relayFirst = relayFirst, environment = environment, relayFactory = { Relay(it).also { r -> relay = r } },
+            restarted = { restarted.add(it) }) { _, packet, _ -> received.add(packet) }
         init { transport.configurePeer(remote.publicKey, remote.discoPublicKey); transport.start() }
-        fun callMeMaybe() = relay.incoming(DerpPacket(remote.publicKey, seal(DiscoveryMessage.CallMeMaybe(listOf(endpoint)))))
+        fun callMeMaybe(endpoints: List<Endpoint> = listOf(endpoint)) = relay.incoming(DerpPacket(remote.publicKey, seal(DiscoveryMessage.CallMeMaybe(endpoints))))
         fun seal(message: DiscoveryMessage): ByteArray = Discovery.seal(message, local.discoPublicKey, remote.discoPrivateKey, remote.discoPublicKey)
         fun ping(socket: Udp): DiscoveryMessage.Ping {
             val end = System.nanoTime() + TimeUnit.SECONDS.toNanos(3)
@@ -119,6 +121,24 @@ class RelayFirstTransportTest {
         .filter { it.first == endpoint && Discovery.sourceKey(it.second) != null }
         .map { Discovery.open(it.second, f.remote.discoPrivateKey).second }
         .filterIsInstance<DiscoveryMessage.Ping>().firstOrNull()
+
+    @Test fun anInvitationThatMovesEveryPortSaysThePeerRestarted() {
+        val f = Fixture()
+        try {
+            eventually { f.environment.sockets.isNotEmpty() }
+            f.transport.authenticated(f.remote.publicKey)
+            f.callMeMaybe(listOf(Endpoint("198.51.100.2", 4000), Endpoint("203.0.113.9", 4000))); barrier(f)
+            f.callMeMaybe(listOf(Endpoint("198.51.100.2", 4000), Endpoint("198.51.100.3", 4000))); barrier(f)
+            assertTrue(f.restarted.isEmpty(), "The first invitation, and one that keeps a port, are no restart")
+            f.callMeMaybe(listOf(Endpoint("198.51.100.2", 4001), Endpoint("198.51.100.3", 4001))); barrier(f)
+            assertEquals(f.remote.publicKey, f.restarted.poll(1, TimeUnit.SECONDS))
+            f.callMeMaybe(listOf(Endpoint("198.51.100.2", 4001), Endpoint("198.51.100.2", 4002))); barrier(f)
+            assertTrue(f.restarted.isEmpty(), "One that keeps a port is not another")
+            // Forged by anyone but the peer: never opened.
+            f.relay.incoming(DerpPacket(NodePrivateKey.generate().publicKey, f.seal(DiscoveryMessage.CallMeMaybe(listOf(Endpoint("198.51.100.2", 4009)))))); barrier(f)
+            assertTrue(f.restarted.isEmpty())
+        } finally { f.close() }
+    }
 
     @Test fun defaultsRemainOptIn() {
         assertFalse(ClientConfiguration().relayFirst)

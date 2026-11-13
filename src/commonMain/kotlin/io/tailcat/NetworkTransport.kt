@@ -16,6 +16,8 @@ internal class NetworkTransport(
     private val environment: NetworkEnvironment = NetworkEnvironment(),
     relayFactory: (((DerpPacket) -> Unit) -> NetworkRelay)? = null,
     private val trace: StartupTrace? = null,
+    /** A peer's authenticated invitation moved every advertised port: a new socket, as when it restarted. */
+    private val restarted: (NodePublicKey) -> Unit = {},
     private val incoming: (NodePublicKey, ByteArray, Boolean) -> Unit,
 ) {
     private class Peer(val disco: ByteArray, var directEnabled: Boolean) {
@@ -431,6 +433,8 @@ internal class NetworkTransport(
                             peer.endpoints.clear(); peer.priorityEndpoints.clear()
                             probes.entries.removeAll { it.value.peer == key }
                         }
+                        // Every port moved: a new socket, as when the peer restarted, so none of the sessions it had.
+                        if (!previous.isNullOrEmpty() && previous.none { old -> advertised.any { it.port == old.port } }) restarted(key)
                         peer.advertisedEndpoints = advertisedSet
                     }
                     val fresh = advertised.filter { rememberEndpoint(peer, it) }
