@@ -74,6 +74,10 @@ class IPStack(
     private val address = localAddress.copyOf()
     private val lock = PlatformLock()
     private val connections = mutableMapOf<Long, TCPState>(); private val flows = mutableMapOf<FlowKey, Long>()
+    // Application-closed streams still finish FIN/ACK and retain TIME-WAIT,
+    // but must not consume the live connection or per-listener budgets.
+    // Bound this independently; evict the oldest close under sustained churn.
+    private val closing = mutableMapOf<Long, TCPState>(); private val closingOrder = ArrayDeque<Long>()
     private val listeners = mutableMapOf<Long, ListenerState>(); private val listenPorts = mutableMapOf<Int, Long>()
     private val udpSockets = mutableMapOf<Long, UDPState>(); private val udpPorts = mutableMapOf<Int, Long>()
     private val udpFlowStates = mutableMapOf<Long, UDPFlowState>(); private val udpFlows = mutableMapOf<FlowKey, Long>()
@@ -130,7 +134,8 @@ class IPStack(
     fun hasTCPFlow(peer: ByteArray, localPort: Int, remotePort: Int): Boolean = locked { FlowKey(Address(peer), localPort, remotePort) in flows }
     fun hasUDPFlow(peer: ByteArray, localPort: Int, remotePort: Int): Boolean = locked { FlowKey(Address(peer), localPort, remotePort) in udpFlows }
     val udpConnectionCount: Int get() = locked { udpFlowStates.size }
-    val connectionCount: Int get() = locked { connections.size }
+    /** Includes closing and TIME-WAIT flows, which may still owe a peer a retransmission or a final ACK. */
+    val connectionCount: Int get() = locked { connections.size + closing.size }
     fun udp(port: Int = 0, idleTimeoutMillis: Long? = 120000): TailcatUDPSocket = locked {
         if (closed) throw error(TailcatTransportException.Reason.CLOSED)
         if (address.size != 16) throw error(TailcatTransportException.Reason.INVALID_ADDRESS)
@@ -162,7 +167,7 @@ class IPStack(
     fun close() = locked {
         if (!closed) {
             closed = true
-            for (id in connections.keys.toList()) fail(id, error(TailcatTransportException.Reason.CLOSED), true)
+            for (id in connections.keys.toList() + closing.keys.toList()) fail(id, error(TailcatTransportException.Reason.CLOSED), true)
             listeners.clear(); listenPorts.clear()
             for (id in udpSockets.keys.toList()) closeUDPInternal(id, error(TailcatTransportException.Reason.CLOSED))
             for (id in udpFlowStates.keys.toList()) closeUDPFlowInternal(id, error(TailcatTransportException.Reason.CLOSED))
@@ -170,7 +175,7 @@ class IPStack(
         }
     }
     fun disconnect(peer: ByteArray) = locked {
-        for (state in connections.values.filter { it.key.peer.bytes.contentEquals(peer) }.toList()) fail(state.id, error(TailcatTransportException.Reason.CLOSED), true)
+        for (state in (connections.values + closing.values).filter { it.key.peer.bytes.contentEquals(peer) }) fail(state.id, error(TailcatTransportException.Reason.CLOSED), true)
         for (state in udpSockets.values) state.pending.removeAll { it.peer.contentEquals(peer) }
         for (state in udpFlowStates.values.filter { it.key.peer.bytes.contentEquals(peer) }.toList()) closeUDPFlowInternal(state.id, error(TailcatTransportException.Reason.CLOSED))
         lock.signalAll()
@@ -199,7 +204,7 @@ class IPStack(
         val headerLength = (unsigned(body[12]) ushr 4) * 4; if (headerLength < 20 || headerLength > body.size) return
         val key = FlowKey(Address(peer), u16(body, 2), u16(body, 0)); if (key.localPort == 0 || key.remotePort == 0) return
         val sequence = u32(body, 4); val acknowledgement = u32(body, 8); val flags = unsigned(body[13]); val payload = body.copyOfRange(headerLength, body.size)
-        val state = flows[key]?.let { connections[it] }
+        val state = flows[key]?.let { connections[it] ?: closing[it] }
         if (state == null) {
             val listenerId = listenPorts[key.localPort]; val listener = listenerId?.let { listeners[it] }
             if (flags and 0x17 == 0x02 && listener != null && listener.pending.size < 128 && connections.size < 1024 && connections.values.count { it.listener == listenerId } < 256) {
@@ -364,11 +369,13 @@ class IPStack(
     }
     internal fun closeConnection(id: Long) = locked {
         val state = connections[id] ?: return@locked; if (state.applicationClosedAt != null) return@locked
+        connections.remove(id); closing[id] = state; closingOrder.addLast(id)
+        if (closingOrder.size > 1024) fail(closingOrder.first(), error(TailcatTransportException.Reason.CLOSED), true)
         state.applicationClosedAt = monotonicMillis(); state.writeClosed = true; state.buffer.clear(); sendACK(state); flush(state); lock.signalAll()
     }
     internal fun abortConnection(id: Long) = locked { fail(id, error(TailcatTransportException.Reason.CLOSED), true) }
     private fun fail(id: Long, failure: Throwable, reset: Boolean = false) {
-        val state = connections.remove(id) ?: return; flows.remove(state.key); state.error = failure; rememberError(id, failure)
+        val state = connections.remove(id) ?: closing.remove(id)?.also { closingOrder.remove(id) } ?: return; flows.remove(state.key); state.error = failure; rememberError(id, failure)
         if (reset && !(state.readEOF && state.finAcknowledged)) emit(tcpPacket(state.key, state.sendNext, state.receiveNext, 0x14, 0))
         state.listener?.let { listeners[it]?.pending?.remove(id) }; lock.signalAll()
     }
@@ -455,7 +462,7 @@ class IPStack(
     }
     fun tick(now: Long = monotonicMillis()) = locked {
         if (closed) return@locked
-        for (state in connections.values.toList()) {
+        for (state in connections.values.toList() + closing.values.toList()) {
             val finished = state.finishedAt
             if (finished != null) { if (now - finished > 120000 && state.buffer.size == 0) fail(state.id, error(TailcatTransportException.Reason.CLOSED)); continue }
             val closedAt = state.applicationClosedAt

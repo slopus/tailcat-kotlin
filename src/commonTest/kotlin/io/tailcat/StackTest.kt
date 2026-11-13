@@ -26,6 +26,7 @@ class StackTest {
         private val lock = PlatformLock(); private val queue = ArrayDeque<Packet>(); private var running = true
         private var zero = false; private var data = false; private var fin = false; private var held: ByteArray? = null; private var heldAck: ByteArray? = null
         private var deliveredResets = 0
+        private var deliveredACKs = 0; private var lastClientFIN: ByteArray? = null
         var drops = 0
             private set
         val first = IPStack(a, { enqueue(true,it) }); val second = IPStack(b, { enqueue(false,it) })
@@ -39,6 +40,7 @@ class StackTest {
                         if (bytes.size >= 60 && bytes[6] == 6.toByte() && bytes[53].u() and 4 != 0) {
                             lock.withLock { deliveredResets++; lock.signalAll() }
                         }
+                        if (bytes.size >= 60 && bytes[6] == 6.toByte() && bytes[53].u() == 0x10) lock.withLock { deliveredACKs++; lock.signalAll() }
                     }
                 }
                 first.tick(); second.tick()
@@ -50,7 +52,7 @@ class StackTest {
             if (bytes.size < 60 || bytes[6] != 6.toByte()) return listOf(bytes)
             val flags = bytes[53].u(); val size = bytes.size-40-(bytes[52].u() ushr 4)*4; val window = bytes.be16(54)
             if (window == 0) zero = true
-            if (packet.fromA && flags and 1 != 0) fin = true
+            if (packet.fromA && flags and 1 != 0) { fin = true; lastClientFIN = bytes }
             fun drop(): List<ByteArray> { drops++; return emptyList() }
             if (flags and 0x12 == 2 && faults.syn) { faults.syn = false; return drop() }
             if (flags and 0x12 == 0x12 && faults.synack) { faults.synack = false; return drop() }
@@ -75,6 +77,9 @@ class StackTest {
             val end = monotonicMillis()+10000
             while (deliveredResets == 0) { val left = end-monotonicMillis(); check(left > 0); lock.await(left) }
         }
+        fun acks() = lock.withLock { deliveredACKs }
+        fun resets() = lock.withLock { deliveredResets }
+        fun replayClientFIN() { lock.withLock { lastClientFIN }?.let(second::receive) }
         fun close() { first.close(); second.close(); lock.withLock { running = false; lock.signalAll() }; worker.await() }
     }
     private fun drain(stream: TailcatConnection): ByteArray {
@@ -148,6 +153,67 @@ class StackTest {
         } finally { link.close() }
         val blackhole = IPStack(a,{})
         assertFails { blackhole.connect(b,80,30) }; assertEquals(0,blackhole.connectionCount); blackhole.close()
+    }
+    @Test fun thousandsOfShortRequestsKeepEventStreamAlive() {
+        val link = Link()
+        try {
+            val listener = link.second.listen(80)
+            val events = link.first.connect(b, 80); val eventServer = listener.accept(10000)
+            val ready = "event: ready\ndata: {}\n\n".encodeToByteArray()
+            eventServer.write(ready, timeoutMillis = 10000); assertContentEquals(ready, events.read(65536, 10000))
+            var firstPort = -1; var lastPort = -1
+            for (index in 0 until 1300) {
+                val client = link.first.connect(b, 80, 10000); val server = listener.accept(10000)
+                if (firstPort < 0) firstPort = client.localPort
+                lastPort = client.localPort
+                val request = "GET /kv/entry?key=$index HTTP/1.1\r\nHost: fixture\r\nConnection: close\r\n\r\n".encodeToByteArray()
+                client.write(request, timeoutMillis = 10000); assertContentEquals(request, server.read(65536, 10000))
+                val response = "HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\n{}".encodeToByteArray()
+                server.write(response, timeoutMillis = 10000); server.close()
+                assertContentEquals(response, drain(client)); client.close()
+                if (index % 50 == 0) {
+                    val event = "event: change\ndata: $index\n\n".encodeToByteArray()
+                    eventServer.write(event, timeoutMillis = 10000); assertContentEquals(event, events.read(65536, 10000))
+                }
+            }
+            assertFalse(link.first.hasTCPFlow(b, firstPort, 80), "Closing state evicts oldest flows instead of refusing new requests")
+            assertTrue(link.first.hasTCPFlow(b, lastPort, 80), "Recent closing flows remain available for late FINs")
+            assertEquals(1025, link.first.connectionCount, "One active SSE connection and at most 1024 closing flows")
+            val final = "event: change\ndata: after-bulk\n\n".encodeToByteArray()
+            eventServer.write(final, timeoutMillis = 10000); assertContentEquals(final, events.read(65536, 10000))
+            events.close(); eventServer.close()
+        } finally { link.close() }
+    }
+    @Test fun closingFlowsAcknowledgeLateFINAndDisconnectRemovesThem() {
+        val link = Link()
+        try {
+            val listener = link.second.listen(80); val client = link.first.connect(b, 80); val server = listener.accept(10000)
+            client.shutdownOutput(10000); assertTrue(server.read(1, 10000).isEmpty())
+            server.shutdownOutput(10000); server.close(); client.close()
+            val before = link.acks(); link.replayClientFIN()
+            val end = monotonicMillis() + 10000
+            while (link.acks() <= before) { check(monotonicMillis() < end); platformSleep(1) }
+            assertEquals(0, link.resets(), "Retained closing state ACKs a retransmitted FIN without resetting")
+            link.first.disconnect(b)
+            assertEquals(0, link.first.connectionCount); assertFalse(link.first.hasTCPFlow(b, client.localPort, 80))
+        } finally { link.close() }
+    }
+    @Test fun activeConnectionBudgetsStillApply() {
+        val link = Link()
+        try {
+            val streams = mutableListOf<TailcatConnection>()
+            for (port in 80 until 84) {
+                val listener = link.second.listen(port)
+                repeat(256) { streams.add(link.first.connect(b, port, 10000)); listener.accept(10000) }
+                if (port == 80) {
+                    val refused = assertFails { link.first.connect(b, 80, 10000) }
+                    assertEquals(TailcatTransportException.Reason.CONNECTION_REFUSED, (refused as TailcatTransportException).reason, "The live per-listener budget must remain bounded")
+                }
+            }
+            val limited = assertFails { link.first.connect(b, 84, 10000) }
+            assertEquals(TailcatTransportException.Reason.RESOURCE_LIMIT, (limited as TailcatTransportException).reason, "The live global budget must remain bounded")
+            assertEquals(1024, link.first.connectionCount)
+        } finally { link.close() }
     }
     @Test fun udpFlowsAndEmptyDatagrams() {
         val link = Link()
