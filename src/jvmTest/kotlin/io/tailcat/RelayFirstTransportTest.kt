@@ -70,7 +70,7 @@ class RelayFirstTransportTest {
         override fun check(deadlineMillis: Long) { checks++ }
         override fun close() { closed = true; connectionGeneration = null; markers.clear(); resetBarriers.clear() }
     }
-    private class Fixture(val environment: Environment = Environment(), relayFirst: Boolean = true, stun: Boolean = false) {
+    private class Fixture(val environment: Environment = Environment(), relayFirst: Boolean = true, stun: Boolean = false, start: Boolean = true) {
         val local = NodePrivateKey.generate()
         val remote = NodePrivateKey.generate()
         val endpoint = Endpoint("198.51.100.2", 4000)
@@ -80,7 +80,7 @@ class RelayFirstTransportTest {
         val transport = NetworkTransport(local, listOf(DERPNode("fixture", stunPort = if (stun) 3478 else -1)),
             relayFirst = relayFirst, environment = environment, relayFactory = { Relay(it).also { r -> relay = r } },
             restarted = { restarted.add(it) }) { _, packet, _ -> received.add(packet) }
-        init { transport.configurePeer(remote.publicKey, remote.discoPublicKey); transport.start() }
+        init { transport.configurePeer(remote.publicKey, remote.discoPublicKey); if (start) transport.start() }
         fun callMeMaybe(endpoints: List<Endpoint> = listOf(endpoint)) = relay.incoming(DerpPacket(remote.publicKey, seal(DiscoveryMessage.CallMeMaybe(endpoints))))
         fun seal(message: DiscoveryMessage): ByteArray = Discovery.seal(message, local.discoPublicKey, remote.discoPrivateKey, remote.discoPublicKey)
         fun ping(socket: Udp): DiscoveryMessage.Ping {
@@ -121,6 +121,19 @@ class RelayFirstTransportTest {
         .filter { it.first == endpoint && Discovery.sourceKey(it.second) != null }
         .map { Discovery.open(it.second, f.remote.discoPrivateKey).second }
         .filterIsInstance<DiscoveryMessage.Ping>().firstOrNull()
+
+    @Test fun aFullReceiveWindowOfRelayedPacketsWaitsForTheReaderAndWhatOverflowsIsCounted() {
+        // The reader is not running yet: a burst is held, as it is while the reader works through the packets before it.
+        val f = Fixture(start = false)
+        try {
+            for (index in 0..RECEIVE_CAPACITY) f.relay.incoming(DerpPacket(f.remote.publicKey, byteArrayOf(4, 0, 0, 0, (index shr 8).toByte(), index.toByte()) + ByteArray(1194)))
+            assertEquals(1, f.transport.receiveDrops)
+            f.transport.start()
+            val received = List(RECEIVE_CAPACITY) { f.received.poll(5, TimeUnit.SECONDS)!!.let { (it[4].toInt() and 0xff) shl 8 or (it[5].toInt() and 0xff) } }
+            assertEquals((0 until RECEIVE_CAPACITY).toList(), received, "A whole window of 860 segments fits, oldest first")
+            assertNull(f.received.poll(200, TimeUnit.MILLISECONDS))
+        } finally { f.close() }
+    }
 
     @Test fun anInvitationThatMovesEveryPortSaysThePeerRestarted() {
         val f = Fixture()

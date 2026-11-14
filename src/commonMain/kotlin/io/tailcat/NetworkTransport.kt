@@ -50,6 +50,7 @@ internal class NetworkTransport(
     private val stun = mutableMapOf<BytesKey, Pair<Endpoint, Long>>()
     private val observed = mutableMapOf<Endpoint, Long>()
     private val events = ArrayDeque<Event>()
+    private var dropped = 0
     private var closed = false
     private var started = false
     private var generation = 0L
@@ -180,7 +181,19 @@ internal class NetworkTransport(
         }
     }
     private fun normalize(endpoint: Endpoint): Endpoint = try { endpointFromWire(endpoint.wireBytes()) } catch (_: Exception) { endpoint }
-    private fun offer(event: Event) { lock.withLock { if (!closed && events.size < 256) { events.addLast(event); lock.signalAll() } } }
+    /**
+     * Received packets wait here while the engine decrypts the ones before them. A burst is at most what
+     * the peer may have in flight: a full 1 MiB receive window is 860 segments.
+     */
+    private fun offer(event: Event) {
+        lock.withLock {
+            if (closed) return
+            if (events.size >= RECEIVE_CAPACITY) { dropped++; return }
+            events.addLast(event); lock.signalAll()
+        }
+    }
+    /** Received packets dropped because the reader fell [RECEIVE_CAPACITY] behind. */
+    val receiveDrops: Int get() = lock.withLock { dropped }
     private fun consume() {
         while (true) {
             lock.withLock {
@@ -586,3 +599,5 @@ internal class NetworkTransport(
         }
     }
 }
+
+internal const val RECEIVE_CAPACITY = 1024

@@ -109,6 +109,8 @@ class TailcatClient private constructor(private val engine: TailcatEngine) {
      * and a route that still works are kept.
      */
     fun wake() = engine.recheck()
+    /** Received packets dropped because they arrived faster than this client could decrypt them, past a full receive window. */
+    val receiveDrops: Int get() = engine.receiveDrops()
     internal fun resumeForTesting(millis: Long) = engine.resumeForTesting(millis)
     fun close() = engine.close()
     companion object {
@@ -186,6 +188,8 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
     private var closed = false
     private var queueClosed = false
     private var nextToken = 1L
+    /** Received packets dropped because the engine fell behind; guarded by [queueLock]. */
+    private var droppedIncoming = 0
     private var admissionJobs = 0
     private var handlerJobs = 0
     private var lastTick = 0L
@@ -200,7 +204,15 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
     private fun newStack(address: ByteArray): IPStack = IPStack(address, { offer(Event.Outgoing(it)) },
         if (server) null else this.address.serverPublicKey, { raw -> peerKey(raw) })
     private fun newPeer(key: NodePublicKey, disco: ByteArray): Peer = Peer(WireGuard(identity.raw, key.raw, address.presharedKey?.raw ?: ByteArray(32)), disco.copyOf(), monotonicMillis())
-    private fun offer(event: Event) { queueLock.withLock { if (queueClosed) throw TailcatClosedException(); if (events.size >= 512) throw TailcatException("Tunnel queue full"); events.addLast(event); queueLock.signalAll() } }
+    /** Room for a full window of received packets and the flights the stack sends meanwhile. */
+    private fun offer(event: Event) {
+        queueLock.withLock {
+            if (queueClosed) throw TailcatClosedException()
+            if (events.size >= 2 * RECEIVE_CAPACITY) { if (event is Event.Incoming) droppedIncoming++; throw TailcatException("Tunnel queue full") }
+            events.addLast(event); queueLock.signalAll()
+        }
+    }
+    fun receiveDrops(): Int = network.receiveDrops + queueLock.withLock { droppedIncoming }
     fun start(timeoutMillis: Long = 30_000) {
         lock.withLock {
             if (closed) throw TailcatClosedException()
