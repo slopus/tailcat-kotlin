@@ -22,14 +22,16 @@ class StackTest {
         var ack: Boolean = false, var fin: Boolean = false, var reorder: Boolean = false, var duplicate: Boolean = false,
         var reorderAck: Boolean = false, var reopen: Boolean = false, var finAck: Boolean = false)
     private data class Packet(val fromA: Boolean, val bytes: ByteArray)
-    private inner class Link(private val faults: Faults = Faults()) {
+    private inner class Link(private val faults: Faults = Faults(), capacity: Int = 1 shl 20) {
         private val lock = PlatformLock(); private val queue = ArrayDeque<Packet>(); private var running = true
         private var zero = false; private var data = false; private var fin = false; private var held: ByteArray? = null; private var heldAck: ByteArray? = null
         private var deliveredResets = 0
         private var deliveredACKs = 0; private var lastClientFIN: ByteArray? = null
         var drops = 0
             private set
-        val first = IPStack(a, { enqueue(true,it) }); val second = IPStack(b, { enqueue(false,it) })
+        val first = IPStack(a, { enqueue(true,it) }, receiveCapacity = capacity); val second = IPStack(b, { enqueue(false,it) }, receiveCapacity = capacity)
+        /** Every TCP packet offered to the link, in order, before faults. */
+        val seen = ArrayList<Packet>()
         private val worker = Job {
             while (true) {
                 val packet = lock.withLock { if (queue.isEmpty() && running) lock.await(25); if (!running) return@Job; queue.removeFirstOrNull() }
@@ -49,6 +51,7 @@ class StackTest {
         private fun enqueue(fromA: Boolean, bytes: ByteArray) { lock.withLock { if (running && queue.size < 8192) { queue.addLast(Packet(fromA,bytes.copyOf())); lock.signalAll() } } }
         private fun transform(packet: Packet): List<ByteArray> {
             val bytes = packet.bytes
+            if (bytes.size >= 60 && bytes[6] == 6.toByte()) seen.add(packet)
             if (bytes.size < 60 || bytes[6] != 6.toByte()) return listOf(bytes)
             val flags = bytes[53].u(); val size = bytes.size-40-(bytes[52].u() ushr 4)*4; val window = bytes.be16(54)
             if (window == 0) zero = true
@@ -78,6 +81,7 @@ class StackTest {
             while (deliveredResets == 0) { val left = end-monotonicMillis(); check(left > 0); lock.await(left) }
         }
         fun acks() = lock.withLock { deliveredACKs }
+        fun seenSnapshot(): List<Packet> = lock.withLock { seen.toList() }
         fun resets() = lock.withLock { deliveredResets }
         fun replayClientFIN() { lock.withLock { lastClientFIN }?.let(second::receive) }
         fun close() { first.close(); second.close(); lock.withLock { running = false; lock.signalAll() }; worker.await() }
@@ -86,6 +90,50 @@ class StackTest {
         val chunks = mutableListOf<ByteArray>(); var count = 0
         while (true) { val data = stream.read(7777,30000); if (data.isEmpty()) break; chunks.add(data); count += data.size }
         val out = ByteArray(count); var offset = 0; for (data in chunks) { data.copyInto(out,offset); offset += data.size }; return out
+    }
+    @Test fun windowsScalePastSixtyFourKilobytes() {
+        val link = Link()
+        try {
+            val listener = link.second.listen(80); val client = link.first.connect(b,80); val server = listener.accept(10000)
+            // The server writes a megabyte the client doesn't read yet: more than 64 KB must be in flight.
+            val writer = Job { server.write(ByteArray(900_000) { it.toByte() }, timeoutMillis = 30000) }
+            val end = monotonicMillis() + 10000
+            fun seen() = link.seenSnapshot()
+            while (seen().count { !it.fromA && it.bytes.size > 60 } * 1220 < 200_000) { check(monotonicMillis() < end) { "Stuck at a 64 KB window" }; platformSleep(10) }
+            val packets = seen()
+            fun option(bytes: ByteArray, kind: Int): Int? { var i = 60; val end2 = 40 + (bytes[52].u() ushr 4) * 4
+                while (i < end2) { val k = bytes[i].u(); if (k == 0) break; if (k == 1) { i++; continue }; if (k == kind) return i; i += bytes[i + 1].u() }; return null }
+            val syn = packets.first { it.fromA && it.bytes[53].u() and 0x12 == 0x02 }.bytes
+            val synAck = packets.first { !it.fromA && it.bytes[53].u() and 0x12 == 0x12 }.bytes
+            assertEquals(5, syn[checkNotNull(option(syn, 3)) + 2].toInt(), "A 1 MiB buffer offers shift 5")
+            assertEquals(5, synAck[checkNotNull(option(synAck, 3)) + 2].toInt())
+            val ack = packets.first { it.fromA && it.bytes[53].u() == 0x10 }.bytes
+            assertEquals(32768, ack.be16(54), "1 MiB, scaled by 32")
+            var total = 0; while (total < 900_000) total += client.read(65536, 10000).size
+            writer.await(); assertEquals(900_000, total)
+        } finally { link.close() }
+    }
+    @Test fun aPeerThatOffersNoWindowScaleGetsUnscaledWindows() {
+        val sent = ArrayList<ByteArray>()
+        val stack = IPStack(b, { sent.add(it) })
+        try {
+            stack.listen(80)
+            // A SYN with only an MSS option, from a peer that doesn't scale.
+            val body = ByteArray(24); body[1] = 0x30; body[3] = 80; body[7] = 1; body[12] = 0x60; body[13] = 2; body[14] = 0xff.toByte(); body[15] = 0xff.toByte()
+            body[20] = 2; body[21] = 4; body[22] = 0x04; body[23] = 0xc4.toByte()
+            var sum = body.size.toLong() + 6
+            for (i in 0 until 16 step 2) sum += a.be16(i) + b.be16(i)
+            for (i in body.indices step 2) sum += body.be16(i)
+            while (sum ushr 16 != 0L) sum = (sum and 65535) + (sum ushr 16)
+            val checksum = sum.toInt().inv() and 65535; body[16] = (checksum ushr 8).toByte(); body[17] = checksum.toByte()
+            val packet = ByteArray(40 + body.size); packet[0] = 0x60; packet[5] = body.size.toByte(); packet[6] = 6; packet[7] = 64
+            a.copyInto(packet, 8); b.copyInto(packet, 24); body.copyInto(packet, 40)
+            stack.receive(packet)
+            val synAck = sent.single()
+            assertEquals(0x12, synAck[53].u() and 0x12)
+            assertEquals(24, (synAck[52].u() ushr 4) * 4, "No window scale option in the SYN-ACK")
+            assertEquals(65535, synAck.be16(54))
+        } finally { stack.close() }
     }
     @Test fun abortStopsThePeersWriteAtOnce() {
         val link = Link()
@@ -136,7 +184,7 @@ class StackTest {
         } finally { link.close() }
     }
     @Test fun zeroWindowAndLostFinAck() {
-        val link = Link(Faults(reopen=true,finAck=true))
+        val link = Link(Faults(reopen=true,finAck=true), capacity = 65535)
         try {
             val listener = link.second.listen(82); val client = link.first.connect(b,82); val server = listener.accept(10000)
             val payload = ByteArray(90000) { 0x37 }; val writer = Job { client.write(payload,timeoutMillis=30000); client.shutdownOutput(10000) }
@@ -154,7 +202,7 @@ class StackTest {
         } finally { link.close() }
     }
     @Test fun drainGracefulCloseAndTimeouts() {
-        val link = Link()
+        val link = Link(capacity = 65535)
         try {
             val listener = link.second.listen(84); val client = link.first.connect(b,84); val server = listener.accept(10000)
             val payload = ByteArray(100000) { 0x32 }; val writer = Job { client.write(payload,timeoutMillis=30000) }

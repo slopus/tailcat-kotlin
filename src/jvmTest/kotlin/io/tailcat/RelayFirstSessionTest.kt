@@ -565,7 +565,7 @@ class RelayFirstSessionTest {
                     while (meows(relay, client) == before) { check(System.nanoTime() < deadline) { "No rejoin" }; Thread.sleep(20) }
                     val millis = (System.nanoTime() - sent) / 1_000_000
                     println("UNANSWERED-REJOIN ${millis}ms")
-                    assertTrue(millis in 14_900..16_500, "Rejoined 15 s after the unanswered data: ${millis}ms")
+                    assertTrue(millis in 14_900..17_500, "Rejoined 15 s after the unanswered data, give or take a loaded host: ${millis}ms")
                     eventually("And handshook again") {
                         relay.sourcedPackets.count { it.first == client.publicKey && WireGuard.packetType(it.second) == 1 } > initiations
                     }

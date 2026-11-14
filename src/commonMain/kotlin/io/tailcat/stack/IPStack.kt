@@ -23,7 +23,14 @@ class IPStack(
     private val sendPacket: (ByteArray) -> Unit,
     private val peer: NodePublicKey? = null,
     private val peerForAddress: ((ByteArray) -> NodePublicKey?)? = null,
+    /**
+     * Bytes a flow buffers for the application, unread or out of order. At 1 MiB a relayed path with a
+     * 135 ms round trip carries about 7 MB/s; memory is only held while the application falls behind.
+     */
+    private val receiveCapacity: Int = 1 shl 20,
 ) {
+    /** The window scale shift that lets the 16-bit window field state the capacity (RFC 7323). */
+    private val windowShift = (0..14).first { receiveCapacity shr it <= 65535 }
     private class Address(raw: ByteArray) {
         val bytes = raw.copyOf()
         override fun equals(other: Any?): Boolean = other is Address && bytes.contentEquals(other.bytes)
@@ -36,28 +43,51 @@ class IPStack(
     }
     private data class Incoming(val sequence: Long, val payload: ByteArray, val fin: Boolean)
     private class WriteTicket(val id: Long, val data: ByteArray) { var offset = 0; var end: Long? = null; var done = false }
+    /** Unread bytes, up to [capacity]. Storage grows as they arrive and goes once they are read. */
     private class ByteQueue(private val capacity: Int) {
-        private val bytes = ByteArray(capacity)
+        private var bytes = ByteArray(0)
         private var head = 0
         var size = 0
             private set
         fun append(data: ByteArray, offset: Int = 0, length: Int = data.size - offset) {
             check(length <= capacity - size)
-            for (index in 0 until length) bytes[(head + size + index) % capacity] = data[offset + index]
-            size += length
+            if (size + length > bytes.size) grow(size + length)
+            var done = 0
+            while (done < length) {
+                val at = (head + size) % bytes.size; val run = minOf(length - done, bytes.size - at)
+                data.copyInto(bytes, at, offset + done, offset + done + run); size += run; done += run
+            }
         }
         fun read(target: ByteArray, offset: Int, maximum: Int): Int {
-            val count = minOf(size, maximum)
-            for (index in 0 until count) target[offset + index] = bytes[(head + index) % capacity]
-            head = (head + count) % capacity; size -= count; return count
+            val count = minOf(size, maximum); var done = 0
+            while (done < count) {
+                val run = minOf(count - done, bytes.size - head)
+                bytes.copyInto(target, offset + done, head, head + run); head = (head + run) % bytes.size; done += run
+            }
+            size -= count
+            if (size == 0) clear()
+            return count
         }
-        fun clear() { head = 0; size = 0 }
+        private fun grow(needed: Int) {
+            var next = maxOf(4096, bytes.size); while (next < needed) next *= 2
+            val grown = ByteArray(minOf(next, maxOf(capacity, needed)))
+            val first = minOf(size, bytes.size - head)
+            if (size > 0) { bytes.copyInto(grown, 0, head, head + first); bytes.copyInto(grown, first, 0, size - first) }
+            bytes = grown; head = 0
+        }
+        fun clear() { head = 0; size = 0; bytes = ByteArray(0) }
     }
-    private class TCPState(val id: Long, val key: FlowKey, var phase: Phase, sequence: Long, val listener: Long?, now: Long) {
+    private class TCPState(val id: Long, val key: FlowKey, var phase: Phase, sequence: Long, val listener: Long?, now: Long, capacity: Int) {
         var sendUnacknowledged = sequence; var sendNext = sequence; var receiveNext = 0L
         var remoteWindow = 65535; var windowSequence = 0L; var windowAck = 0L; var mss = 1220
-        var congestionWindow = 4880; var slowStartThreshold = 65535; var duplicateACKs = 0; var retransmitDelay = 500L
-        val segments = ArrayList<Segment>(); val incoming = ArrayList<Incoming>(); val buffer = ByteQueue(65535); val writes = ArrayList<WriteTicket>()
+        var congestionWindow = 4880; var slowStartThreshold = SEND_WINDOW_LIMIT; var duplicateACKs = 0; var retransmitDelay = 500L
+        val segments = ArrayList<Segment>(); val buffer = ByteQueue(capacity); val writes = ArrayList<WriteTicket>()
+        /** Held out of order, by sequence. */
+        val incoming = ArrayList<Incoming>(); var incomingBytes = 0
+        /** RFC 7323 shifts for the windows the peer advertises and for ours: zero unless the SYN and the SYN-ACK each offered one. */
+        var sendScale = 0; var receiveScale = 0
+        /** Whether our SYN or SYN-ACK carries the window scale option. */
+        var offersScale = true
         var writeClosed = false; var applicationClosedAt: Long? = null; var finSequence: Long? = null
         var finAcknowledged = false; var readEOF = false; var lastActivity = now; var persistSent = now - 1000
         var finishedAt: Long? = null; var error: Throwable? = null
@@ -115,7 +145,7 @@ class IPStack(
     fun connect(peer: ByteArray, port: Int, timeoutMillis: Long = 30000): TailcatConnection = locked {
         validate(peer, port); val until = deadline(timeoutMillis)
         if (connections.size >= 1024) throw error(TailcatTransportException.Reason.RESOURCE_LIMIT)
-        val state = TCPState(nextId++, FlowKey(Address(peer), allocatePort(false), port), Phase.SYN_SENT, u32(secureRandom(4), 0), null, monotonicMillis())
+        val state = TCPState(nextId++, FlowKey(Address(peer), allocatePort(false), port), Phase.SYN_SENT, u32(secureRandom(4), 0), null, monotonicMillis(), receiveCapacity)
         connections[state.id] = state; flows[state.key] = state.id; transmit(state, 0x02)
         try {
             while (state.phase != Phase.ESTABLISHED) { state.error?.let { throw it }; await(until) }
@@ -208,8 +238,10 @@ class IPStack(
         if (state == null) {
             val listenerId = listenPorts[key.localPort]; val listener = listenerId?.let { listeners[it] }
             if (flags and 0x17 == 0x02 && listener != null && listener.pending.size < 128 && connections.size < 1024 && connections.values.count { it.listener == listenerId } < 256) {
-                val incoming = TCPState(nextId++, key, Phase.SYN_RECEIVED, u32(secureRandom(4), 0), listenerId, monotonicMillis())
+                val incoming = TCPState(nextId++, key, Phase.SYN_RECEIVED, u32(secureRandom(4), 0), listenerId, monotonicMillis(), receiveCapacity)
                 incoming.receiveNext = add(sequence, 1); incoming.windowSequence = sequence; incoming.remoteWindow = u16(body, 14); incoming.mss = parseMSS(body, headerLength)
+                val shift = parseWindowScale(body, headerLength)
+                if (shift != null) { incoming.sendScale = shift; incoming.receiveScale = windowShift } else incoming.offersScale = false
                 connections[incoming.id] = incoming; flows[key] = incoming.id; transmit(incoming, 0x12)
             } else reset(key, sequence, acknowledgement, flags, payload.size)
             return
@@ -220,7 +252,9 @@ class IPStack(
             if (flags and 0x04 != 0) { fail(state.id, error(TailcatTransportException.Reason.CONNECTION_REFUSED)); return }
             if (flags and 0x02 == 0) return
             state.receiveNext = add(sequence, 1); state.remoteWindow = u16(body, 14); state.windowSequence = sequence; state.windowAck = acknowledgement
-            state.mss = parseMSS(body, headerLength); state.phase = Phase.ESTABLISHED; acknowledge(state, acknowledgement); sendACK(state); return
+            state.mss = parseMSS(body, headerLength)
+            parseWindowScale(body, headerLength)?.let { state.sendScale = it; state.receiveScale = windowShift }
+            state.phase = Phase.ESTABLISHED; acknowledge(state, acknowledgement); sendACK(state); return
         }
         if (flags and 0x04 != 0) {
             // Both FINs are complete. Preserve buffered bytes and orderly EOF
@@ -243,7 +277,7 @@ class IPStack(
         }
         val oldWindow = state.remoteWindow
         if (before(state.windowSequence, sequence) || (state.windowSequence == sequence && !before(acknowledgement, state.windowAck))) {
-            state.remoteWindow = u16(body, 14); state.windowSequence = sequence; state.windowAck = acknowledgement
+            state.remoteWindow = u16(body, 14) shl state.sendScale; state.windowSequence = sequence; state.windowAck = acknowledgement
         }
         if (acknowledgement == state.sendUnacknowledged && payload.isEmpty() && flags and 1 == 0 && oldWindow == state.remoteWindow && state.segments.isNotEmpty()) {
             state.duplicateACKs++
@@ -264,15 +298,20 @@ class IPStack(
         if (flags and 0x10 != 0) emit(tcpPacket(key, acknowledgement, 0, 0x04, 0))
         else { val consumed = payloadLength + (if (flags and 0x02 != 0) 1 else 0) + (if (flags and 0x01 != 0) 1 else 0); emit(tcpPacket(key, 0, add(sequence, consumed), 0x14, 0)) }
     }
-    private fun parseMSS(body: ByteArray, headerLength: Int): Int {
-        var offset = 20; var result = 1220
+    private fun parseMSS(body: ByteArray, headerLength: Int): Int =
+        option(2, 4, body, headerLength)?.let { u16(body, it + 2).coerceIn(1, 1220) } ?: 1220
+    /** The shift a SYN's window scale option offers, capped at 14 (RFC 7323 2.3). */
+    private fun parseWindowScale(body: ByteArray, headerLength: Int): Int? =
+        option(3, 3, body, headerLength)?.let { minOf(14, unsigned(body[it + 2])) }
+    private fun option(wanted: Int, wantedLength: Int, body: ByteArray, headerLength: Int): Int? {
+        var offset = 20
         while (offset < headerLength) {
             val kind = unsigned(body[offset]); if (kind == 0) break; if (kind == 1) { offset++; continue }
             if (offset + 1 >= headerLength) break
             val length = unsigned(body[offset + 1]); if (length < 2 || offset + length > headerLength) break
-            if (kind == 2 && length == 4) result = u16(body, offset + 2).coerceIn(1, 1220); offset += length
+            if (kind == wanted && length == wantedLength) return offset; offset += length
         }
-        return result
+        return null
     }
     /**
      * The way to the peer was just replaced: what each flow sent into the old one was lost, and would
@@ -303,12 +342,14 @@ class IPStack(
         }
         if (advanced > 0) {
             val increment = if (state.congestionWindow < state.slowStartThreshold) minOf(advanced, state.mss) else maxOf(1, state.mss * minOf(advanced, state.mss) / maxOf(1, state.congestionWindow))
-            state.congestionWindow = minOf(65535, state.congestionWindow + increment)
+            state.congestionWindow = minOf(SEND_WINDOW_LIMIT, state.congestionWindow + increment)
         }
         while (state.writes.isNotEmpty()) { val write = state.writes.first(); val end = write.end ?: break; if (before(ack, end)) break; write.done = true; state.writes.removeAt(0) }
         state.finSequence?.let { if (before(it, ack)) { state.finAcknowledged = true; if (state.readEOF) state.finishedAt = monotonicMillis() } }
     }
-    private fun receiveWindow(state: TCPState): Int = maxOf(0, 65535 - state.buffer.size - state.incoming.sumOf { it.payload.size })
+    private fun receiveWindow(state: TCPState): Int = maxOf(0, receiveCapacity - state.buffer.size - state.incomingBytes)
+    /** The window field for a segment: scaled down, and never scaled in a SYN (RFC 7323 2.2). */
+    private fun advertise(state: TCPState, syn: Boolean = false): Int = minOf(65535, receiveWindow(state) shr if (syn) 0 else state.receiveScale)
     private fun ingest(state: TCPState, sequence: Long, payload: ByteArray, fin: Boolean) {
         if (state.readEOF) return
         var seq = sequence; var data = payload
@@ -325,11 +366,15 @@ class IPStack(
             state.receiveNext = add(state.receiveNext, data.size)
             if (acceptedFIN) { state.readEOF = true; state.receiveNext = add(state.receiveNext, 1) }
         } else if (data.isNotEmpty() || acceptedFIN) {
-            if (state.incoming.size < 256 && state.incoming.none { it.sequence == seq && it.payload.size >= data.size }) state.incoming.add(Incoming(seq, data, acceptedFIN))
+            // Enough segments for a whole window lost behind one hole.
+            if (state.incoming.size < 1024 && state.incoming.none { it.sequence == seq && it.payload.size >= data.size }) {
+                val index = state.incoming.indexOfFirst { before(seq, it.sequence) }.let { if (it < 0) state.incoming.size else it }
+                state.incoming.add(index, Incoming(seq, data, acceptedFIN)); state.incomingBytes += data.size
+            }
         }
-        state.incoming.sortWith(Comparator { a, b -> if (a.sequence == b.sequence) 0 else if (before(a.sequence, b.sequence)) -1 else 1 })
         while (state.incoming.isNotEmpty() && !state.readEOF) {
-            val first = state.incoming.first(); if (before(state.receiveNext, first.sequence)) break; state.incoming.removeAt(0)
+            val first = state.incoming.first(); if (before(state.receiveNext, first.sequence)) break
+            state.incoming.removeAt(0); state.incomingBytes -= first.payload.size
             val skip = distance(state.receiveNext, first.sequence)
             if (skip <= first.payload.size) {
                 val count = first.payload.size - skip.toInt()
@@ -338,14 +383,18 @@ class IPStack(
                 if (first.fin) { state.readEOF = true; state.receiveNext = add(state.receiveNext, 1) }
             }
         }
-        if (state.readEOF) { state.incoming.clear(); if (state.finAcknowledged) state.finishedAt = monotonicMillis() }
+        if (state.readEOF) { state.incoming.clear(); state.incomingBytes = 0; if (state.finAcknowledged) state.finishedAt = monotonicMillis() }
     }
     private fun emit(packet: ByteArray) { try { sendPacket(packet) } catch (_: Exception) { } }
     private fun transmit(state: TCPState, flags: Int, payload: ByteArray = ByteArray(0)) {
         val segment = Segment(state.sendNext, flags, payload, monotonicMillis()); state.sendNext = segment.end; state.segments.add(segment); retransmit(state, segment)
     }
-    private fun retransmit(state: TCPState, segment: Segment) = emit(tcpPacket(state.key, segment.sequence, state.receiveNext, segment.flags, receiveWindow(state), segment.payload))
-    private fun sendACK(state: TCPState) = emit(tcpPacket(state.key, state.sendNext, state.receiveNext, 0x10, receiveWindow(state)))
+    private fun retransmit(state: TCPState, segment: Segment) {
+        val syn = segment.flags and 0x02 != 0
+        emit(tcpPacket(state.key, segment.sequence, state.receiveNext, segment.flags, advertise(state, syn), segment.payload,
+            if (syn && state.offersScale) windowShift else null))
+    }
+    private fun sendACK(state: TCPState) = emit(tcpPacket(state.key, state.sendNext, state.receiveNext, 0x10, advertise(state)))
     private fun flush(state: TCPState) {
         if (state.phase != Phase.ESTABLISHED) return
         for (write in state.writes) {
@@ -492,7 +541,7 @@ class IPStack(
                 state.retransmitDelay = minOf(8000L, state.retransmitDelay * 2); first.sent = now; first.retries++; retransmit(state, first)
             }
             if (state.remoteWindow == 0 && (state.writes.isNotEmpty() || state.writeClosed) && now - state.persistSent >= 1000) {
-                state.persistSent = now; emit(tcpPacket(state.key, add(state.sendNext, -1), state.receiveNext, 0x10, receiveWindow(state)))
+                state.persistSent = now; emit(tcpPacket(state.key, add(state.sendNext, -1), state.receiveNext, 0x10, advertise(state)))
                 if (now - state.lastActivity > 120000) fail(state.id, error(TailcatTransportException.Reason.TIMED_OUT))
             }
         }
@@ -500,11 +549,12 @@ class IPStack(
         for (flow in udpFlowStates.values.toList()) if (now - flow.activity >= flow.idleTimeout) closeUDPFlowInternal(flow.id, error(TailcatTransportException.Reason.TIMED_OUT))
         lock.signalAll()
     }
-    private fun tcpPacket(key: FlowKey, sequence: Long, ack: Long, flags: Int, window: Int, payload: ByteArray = ByteArray(0)): ByteArray {
-        val headerLength = if (flags and 0x02 != 0) 24 else 20; val body = ByteArray(headerLength + payload.size)
+    private fun tcpPacket(key: FlowKey, sequence: Long, ack: Long, flags: Int, window: Int, payload: ByteArray = ByteArray(0), windowScale: Int? = null): ByteArray {
+        val headerLength = if (flags and 0x02 == 0) 20 else if (windowScale == null) 24 else 28; val body = ByteArray(headerLength + payload.size)
         put16(body, 0, key.localPort); put16(body, 2, key.remotePort); put32(body, 4, sequence); put32(body, 8, ack)
         body[12] = ((headerLength / 4) shl 4).toByte(); body[13] = flags.toByte(); put16(body, 14, window)
         if (flags and 0x02 != 0) { body[20] = 2; body[21] = 4; put16(body, 22, 1220) }
+        if (windowScale != null) { body[24] = 1; body[25] = 3; body[26] = 3; body[27] = windowScale.toByte() }
         payload.copyInto(body, headerLength); put16(body, 16, checksum(address, key.peer.bytes, 6, body)); return ipv6(key.peer.bytes, 6, body)
     }
     private fun ipv6(peer: ByteArray, protocol: Int, body: ByteArray): ByteArray {
@@ -513,6 +563,8 @@ class IPStack(
     }
     private companion object {
         const val MASK = 0xffffffffL
+        /** Bounds a flow's congestion window: at 215 full segments, four flows in flight fit the engine's queue. */
+        const val SEND_WINDOW_LIMIT = 262_144
         fun unsigned(value: Byte): Int = value.toInt() and 255
         fun add(value: Long, count: Int): Long = (value + count) and MASK
         fun distance(a: Long, b: Long): Long = (a - b) and MASK
