@@ -409,7 +409,8 @@ class RelayFirstSessionTest {
                 try {
                     exchange(connection, "initial relay stream")
                     val connections = relay.connections.get()
-                    relay.silence(client.publicKey)
+                    // A frame already on its way would answer the check; let it land first.
+                    relay.silence(client.publicKey); Thread.sleep(200)
                     val woke = System.nanoTime()
                     client.wake()
                     eventually("The silent relay is replaced") { relay.connections.get() > connections }
@@ -680,7 +681,8 @@ class RelayFirstSessionTest {
                     // A check on a live relay measures its round trip, a millisecond here.
                     client.wake(); Thread.sleep(500)
                     val connections = relay.connections.get()
-                    relay.silence(client.publicKey)
+                    // A frame already on its way would answer the check; let it land first.
+                    relay.silence(client.publicKey); Thread.sleep(200)
                     val woke = System.nanoTime()
                     client.wake()
                     eventually("The silent relay is replaced") { relay.connections.get() > connections }
