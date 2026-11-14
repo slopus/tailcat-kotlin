@@ -127,6 +127,8 @@ fun main(args: Array<String>) {
 for acknowledgement; `drain` waits for outstanding writes without sending FIN.
 `shutdownOutput` waits for FIN acknowledgement and keeps reads open. For larger
 transfers, read and write concurrently so neither side fills the other's buffer.
+`close` sends FIN after what was written and discards what still arrives; `abort`
+resets the stream, so a peer writing a response nobody wants stops at once.
 
 Close servers, clients, listeners and streams when their owning feature ends.
 Closing an owner interrupts its pending operations and closes its sockets. A

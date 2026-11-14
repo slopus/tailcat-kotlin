@@ -32,8 +32,13 @@ class TailcatConnection internal constructor(
     fun drain(timeoutMillis: Long = 0) = stack.drain(id, timeoutMillis)
     fun shutdownOutput(timeoutMillis: Long = 0) = stack.closeWrite(id, timeoutMillis)
     fun closeWrite(timeoutMillis: Long = 0) = shutdownOutput(timeoutMillis)
+    /** Sends FIN after what was written, and takes in and discards whatever still comes. */
     fun close() = stack.closeConnection(id)
-    internal fun abort() = stack.abortConnection(id)
+    /**
+     * Resets the stream: the peer's reads and writes fail at once and it sends no more. For a response
+     * no longer wanted, which [close] would take in whole and discard.
+     */
+    fun abort() = stack.abortConnection(id)
 }
 
 class TailcatListener internal constructor(

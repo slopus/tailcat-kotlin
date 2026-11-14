@@ -87,6 +87,20 @@ class StackTest {
         while (true) { val data = stream.read(7777,30000); if (data.isEmpty()) break; chunks.add(data); count += data.size }
         val out = ByteArray(count); var offset = 0; for (data in chunks) { data.copyInto(out,offset); offset += data.size }; return out
     }
+    @Test fun abortStopsThePeersWriteAtOnce() {
+        val link = Link()
+        try {
+            val listener = link.second.listen(80); val client = link.first.connect(b,80); val server = listener.accept(10000)
+            val response = Job { server.write(ByteArray(4 * 1024 * 1024), timeoutMillis = 30000) }
+            assertTrue(client.read(1000, 10000).isNotEmpty())
+            val aborted = monotonicMillis()
+            client.abort()
+            val failure = assertFailsWith<TailcatTransportException> { response.await(10000) }
+            assertEquals(TailcatTransportException.Reason.CONNECTION_RESET, failure.reason)
+            assertTrue(monotonicMillis() - aborted < 2000, "The response stopped at once, not after 4 MiB")
+            assertFailsWith<TailcatTransportException> { client.read(100, 1000) }
+        } finally { link.close() }
+    }
     @Test fun halfCloseAndResponse() {
         val link = Link()
         try {
