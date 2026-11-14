@@ -81,6 +81,8 @@ class IPStack(
         var sendUnacknowledged = sequence; var sendNext = sequence; var receiveNext = 0L
         var remoteWindow = 65535; var windowSequence = 0L; var windowAck = 0L; var mss = 1220
         var congestionWindow = 4880; var slowStartThreshold = SEND_WINDOW_LIMIT; var duplicateACKs = 0; var retransmitDelay = 500L
+        /** SND.NXT when loss recovery began; until it is acknowledged, each partial ACK resends the next hole (RFC 6582). */
+        var recover: Long? = null
         val segments = ArrayList<Segment>(); val buffer = ByteQueue(capacity); val writes = ArrayList<WriteTicket>()
         /** Held out of order, by sequence. */
         val incoming = ArrayList<Incoming>(); var incomingBytes = 0
@@ -281,7 +283,7 @@ class IPStack(
         }
         if (acknowledgement == state.sendUnacknowledged && payload.isEmpty() && flags and 1 == 0 && oldWindow == state.remoteWindow && state.segments.isNotEmpty()) {
             state.duplicateACKs++
-            if (state.duplicateACKs == 3) { state.slowStartThreshold = maxOf(state.mss * 2, state.congestionWindow / 2); state.congestionWindow = state.slowStartThreshold; retransmit(state, state.segments.first()) }
+            if (state.duplicateACKs == 3 && state.recover == null) { enterRecovery(state); state.congestionWindow = state.slowStartThreshold; resend(state) }
         } else if (before(state.sendUnacknowledged, acknowledgement)) acknowledge(state, acknowledgement)
         if (payload.isNotEmpty() || flags and 1 != 0) { ingest(state, sequence, payload, flags and 1 != 0); sendACK(state) }
         flush(state)
@@ -322,9 +324,8 @@ class IPStack(
         if (closed) return@locked
         val now = monotonicMillis()
         for (state in connections.values + closing.values) {
-            val first = state.segments.firstOrNull() ?: continue
-            if (state.finishedAt != null) continue
-            state.retransmitDelay = 500; first.sent = now; retransmit(state, first)
+            if (state.segments.isEmpty() || state.finishedAt != null) continue
+            state.retransmitDelay = 500; resend(state, now)
         }
     }
     /** Some flow has had to send its first unacknowledged segment again, and still waits. */
@@ -340,8 +341,10 @@ class IPStack(
             val count = distance(ack, first.sequence).toInt()
             if (count < first.payload.size) state.segments[0] = first.copy(sequence = ack, payload = first.payload.copyOfRange(count, first.payload.size))
         }
+        state.recover?.let { if (before(ack, it)) { if (state.segments.isNotEmpty()) resend(state) } else state.recover = null }
         if (advanced > 0) {
-            val increment = if (state.congestionWindow < state.slowStartThreshold) minOf(advanced, state.mss) else maxOf(1, state.mss * minOf(advanced, state.mss) / maxOf(1, state.congestionWindow))
+            // A delayed ACK covers two segments (RFC 3465, L = 2).
+            val increment = if (state.congestionWindow < state.slowStartThreshold) minOf(advanced, 2 * state.mss) else maxOf(1, state.mss * minOf(advanced, state.mss) / maxOf(1, state.congestionWindow))
             state.congestionWindow = minOf(SEND_WINDOW_LIMIT, state.congestionWindow + increment)
         }
         while (state.writes.isNotEmpty()) { val write = state.writes.first(); val end = write.end ?: break; if (before(ack, end)) break; write.done = true; state.writes.removeAt(0) }
@@ -388,6 +391,15 @@ class IPStack(
     private fun emit(packet: ByteArray) { try { sendPacket(packet) } catch (_: Exception) { } }
     private fun transmit(state: TCPState, flags: Int, payload: ByteArray = ByteArray(0)) {
         val segment = Segment(state.sendNext, flags, payload, monotonicMillis()); state.sendNext = segment.end; state.segments.add(segment); retransmit(state, segment)
+    }
+    /** Halves the flight, not the congestion window, which an earlier timeout may already have cut to a segment (RFC 5681 equation 4). */
+    private fun enterRecovery(state: TCPState) {
+        state.slowStartThreshold = maxOf(2 * state.mss, distance(state.sendNext, state.sendUnacknowledged).toInt() / 2)
+        state.recover = state.sendNext
+    }
+    /** Sends the first unacknowledged segment again, restarting its timer. */
+    private fun resend(state: TCPState, now: Long = monotonicMillis()) {
+        val first = state.segments.first(); first.sent = now; retransmit(state, first)
     }
     private fun retransmit(state: TCPState, segment: Segment) {
         val syn = segment.flags and 0x02 != 0
@@ -541,8 +553,8 @@ class IPStack(
             val first = state.segments.firstOrNull()
             if (first != null && now - first.sent >= state.retransmitDelay) {
                 if (first.retries >= 8) { fail(state.id, error(TailcatTransportException.Reason.TIMED_OUT)); continue }
-                state.slowStartThreshold = maxOf(state.mss * 2, state.congestionWindow / 2); state.congestionWindow = state.mss
-                state.retransmitDelay = minOf(8000L, state.retransmitDelay * 2); first.sent = now; first.retries++; retransmit(state, first)
+                enterRecovery(state); state.congestionWindow = state.mss
+                state.retransmitDelay = minOf(8000L, state.retransmitDelay * 2); first.retries++; resend(state, now)
             }
             if (state.remoteWindow == 0 && (state.writes.isNotEmpty() || state.writeClosed) && now - state.persistSent >= 1000) {
                 state.persistSent = now; emit(tcpPacket(state.key, add(state.sendNext, -1), state.receiveNext, 0x10, advertise(state)))

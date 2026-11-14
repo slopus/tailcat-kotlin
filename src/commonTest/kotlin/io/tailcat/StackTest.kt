@@ -141,31 +141,92 @@ class StackTest {
             assertEquals(65535, synAck.be16(54))
         } finally { stack.close() }
     }
-    @Test fun aWindowOpeningBytesAtATimeWaitsForAFullSegmentWhileAnACKIsDue() {
-        val lock = PlatformLock(); val sent = ArrayList<ByteArray>()
+    /** A stack at [b] whose port 80 is driven by hand from [a]: what it sends is logged, what it gets is [segment]s. */
+    private inner class ScriptedPeer(window: Int = 65535) {
+        private val lock = PlatformLock(); private val sent = ArrayList<ByteArray>()
         val stack = IPStack(b, { lock.withLock { sent.add(it); lock.signalAll() } })
-        fun payloads(): List<Int> = lock.withLock { sent.map { it.size - 40 - (it[52].u() ushr 4) * 4 }.filter { it > 0 } }
-        fun awaitPayload(total: Int) = lock.withLock {
-            val end = monotonicMillis() + 5000
-            while (payloads().sum() < total) { val left = end - monotonicMillis(); check(left > 0) { "Sent ${'$'}{payloads()}" }; lock.await(left) }
-        }
-        try {
+        /** The stack's first data sequence number. */
+        val start: Long
+        val server: TailcatConnection
+        init {
             val listener = stack.listen(80)
-            stack.receive(segment(1, 0, 2, 2440, mss = true))
-            val start = lock.withLock { sent.single() }.be32(44) + 1
-            stack.receive(segment(2, start, 0x10, 2440))
-            val server = listener.accept(5000)
-            val writer = Job { server.write(ByteArray(10_000), timeoutMillis = 30000) }
-            awaitPayload(2440)
+            stack.receive(segment(1, 0, 2, window, mss = true))
+            start = lock.withLock { sent.single() }.be32(44) + 1
+            stack.receive(segment(2, start, 0x10, window))
+            server = listener.accept(5000)
+        }
+        fun count() = lock.withLock { sent.size }
+        /** Data segments sent since packet [from], as (sequence, length). */
+        fun data(from: Int = 0): List<Pair<Long, Int>> = lock.withLock {
+            sent.drop(from).map { it.be32(44) to it.size - 40 - (it[52].u() ushr 4) * 4 }.filter { it.second > 0 }
+        }
+        fun await(from: Int, count: Int): List<Pair<Long, Int>> = lock.withLock {
+            val end = monotonicMillis() + 5000
+            while (data(from).size < count) { val left = end - monotonicMillis(); check(left > 0) { "Sent ${'$'}{data(from)}" }; lock.await(left) }
+            data(from)
+        }
+        /** No more than [count] data segments since [from], once the stack has had time to send another. */
+        fun settled(from: Int, count: Int): List<Pair<Long, Int>> { await(from, count); platformSleep(100); return data(from) }
+        fun ack(ack: Long, window: Int = 65535) = stack.receive(segment(2, ack, 0x10, window))
+    }
+    @Test fun aWindowOpeningBytesAtATimeWaitsForAFullSegmentWhileAnACKIsDue() {
+        val peer = ScriptedPeer(window = 2440)
+        try {
+            val writer = Job { peer.server.write(ByteArray(10_000), timeoutMillis = 30000) }
+            peer.await(0, 2)
             // The first segment is acknowledged and the window opens ten bytes past the second.
-            stack.receive(segment(2, start + 1220, 0x10, 1230))
-            platformSleep(200)
-            assertEquals(listOf(1220, 1220), payloads(), "No ten-byte segment while the second is in flight")
-            stack.receive(segment(2, start + 2440, 0x10, 2440))
-            awaitPayload(4880)
-            assertEquals(listOf(1220, 1220, 1220, 1220), payloads())
-            stack.close(); runCatching { writer.await(5000) }
-        } finally { stack.close() }
+            peer.ack(peer.start + 1220, window = 1230)
+            assertEquals(listOf(1220, 1220), peer.settled(0, 2).map { it.second }, "No ten-byte segment while the second is in flight")
+            peer.ack(peer.start + 2440, window = 2440)
+            assertEquals(listOf(1220, 1220, 1220, 1220), peer.settled(0, 4).map { it.second })
+            peer.stack.close(); runCatching { writer.await(5000) }
+        } finally { peer.stack.close() }
+    }
+    @Test fun aPartialACKResendsTheNextHoleWithoutATimeout() {
+        // The stack's timers only run on tick(), which this test never calls.
+        val peer = ScriptedPeer()
+        try {
+            val first = peer.start
+            val writer = Job { peer.server.write(ByteArray(4880), timeoutMillis = 30000) }
+            assertEquals((0 until 4).map { first + it * 1220 }, peer.await(0, 4).map { it.first })
+            // The first two segments are lost: three duplicate ACKs, then the resent first one is acknowledged only up to the second.
+            val before = peer.count()
+            repeat(3) { peer.ack(first) }
+            assertEquals(listOf(first), peer.await(before, 1).map { it.first })
+            peer.ack(first + 1220)
+            assertEquals(listOf(first, first + 1220), peer.settled(before, 2).map { it.first })
+            peer.ack(first + 4880)
+            writer.await(5000)
+        } finally { peer.stack.close() }
+    }
+    @Test fun repeatedTimeoutsKeepHalfTheFlightAsSlowStartThreshold() {
+        val peer = ScriptedPeer()
+        try {
+            val writer = Job { peer.server.write(ByteArray(400_000), timeoutMillis = 30000) }
+            // Acknowledge each segment on its own until 32 are in flight.
+            var flight = peer.await(0, 4)
+            while (flight.size < 32) {
+                val before = peer.count()
+                for ((sequence, length) in flight) peer.ack(sequence + length)
+                flight = peer.settled(before, 2 * flight.size)
+            }
+            assertEquals(32, flight.size)
+            val acked = flight.first().first; val end = flight.last().let { it.first + it.second }
+            // Two timeouts in a row: the second must not take the threshold from the one-segment window the first left.
+            val before = peer.count()
+            val now = monotonicMillis()
+            peer.stack.tick(now + 600); peer.stack.tick(now + 1600)
+            assertEquals(listOf(acked, acked), peer.data(before).map { it.first })
+            val afterTimeouts = peer.count()
+            peer.ack(end)
+            // Slow start from one segment: the ACK opens three, and those three six.
+            val next = peer.settled(afterTimeouts, 3)
+            assertEquals(3, next.size)
+            val round = peer.count()
+            for ((sequence, length) in next) peer.ack(sequence + length)
+            assertEquals(6, peer.settled(round, 6).size)
+            peer.stack.close(); runCatching { writer.await(5000) }
+        } finally { peer.stack.close() }
     }
     @Test fun abortStopsThePeersWriteAtOnce() {
         val link = Link()
