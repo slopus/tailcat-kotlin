@@ -71,12 +71,16 @@ private fun clockMillis(clock: clockid_t): Long = memScoped {
     val time = alloc<timespec>(); check(clock_gettime(clock, time.ptr) == 0); time.tv_sec * 1000 + time.tv_nsec / 1_000_000
 }
 internal actual fun monotonicMillis(): Long = clockMillis(CLOCK_MONOTONIC)
+internal actual fun monotonicNanos(): Long = memScoped {
+    val time = alloc<timespec>(); check(clock_gettime(CLOCK_MONOTONIC, time.ptr) == 0); time.tv_sec * 1_000_000_000 + time.tv_nsec
+}
 internal actual fun wallClockMillis(): Long = clockMillis(CLOCK_REALTIME)
-internal actual fun platformSleep(millis: Long) {
-    require(millis >= 0)
+internal actual fun platformSleep(millis: Long) { require(millis >= 0); platformSleepNanos(millis * 1_000_000) }
+internal actual fun platformSleepNanos(nanos: Long) {
+    require(nanos >= 0)
     memScoped {
         val request = alloc<timespec>(); val remainder = alloc<timespec>()
-        request.tv_sec = millis / 1000; request.tv_nsec = millis % 1000 * 1_000_000
+        request.tv_sec = nanos / 1_000_000_000; request.tv_nsec = nanos % 1_000_000_000
         while (nanosleep(request.ptr, remainder.ptr) != 0) {
             if (errno != EINTR) error("nanosleep: $errno")
             request.tv_sec = remainder.tv_sec; request.tv_nsec = remainder.tv_nsec

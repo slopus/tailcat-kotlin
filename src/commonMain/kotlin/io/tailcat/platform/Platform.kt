@@ -22,9 +22,11 @@ internal expect class PlatformThread {
 }
 internal expect fun startThread(name: String, block: () -> Unit): PlatformThread
 internal expect fun monotonicMillis(): Long
+internal expect fun monotonicNanos(): Long
 internal expect fun wallClockMillis(): Long
 internal expect fun secureRandom(count: Int): ByteArray
 internal expect fun platformSleep(millis: Long)
+internal expect fun platformSleepNanos(nanos: Long)
 
 internal data class Endpoint(val host: String, val port: Int) {
     init { require(port in 0..65535) }

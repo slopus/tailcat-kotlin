@@ -45,6 +45,7 @@ internal actual class PlatformThread internal constructor(private val thread: Th
 }
 internal actual fun startThread(name: String, block: () -> Unit): PlatformThread = PlatformThread(Thread(block, name).apply { isDaemon = true; start() })
 internal actual fun monotonicMillis(): Long = System.nanoTime() / 1_000_000L
+internal actual fun monotonicNanos(): Long = System.nanoTime()
 internal actual fun wallClockMillis(): Long = System.currentTimeMillis()
 private val random = SecureRandom()
 private val tlsInitializer = ThreadPoolExecutor(1,1,0L,TimeUnit.MILLISECONDS,ArrayBlockingQueue<Runnable>(2),
@@ -61,6 +62,7 @@ private val insecureTestFactory by lazy { tlsInitializer.submit<SSLSocketFactory
 } }
 internal actual fun secureRandom(count: Int): ByteArray { require(count >= 0); return ByteArray(count).also(random::nextBytes) }
 internal actual fun platformSleep(millis: Long) { require(millis >= 0); Thread.sleep(millis) }
+internal actual fun platformSleepNanos(nanos: Long) { require(nanos >= 0); Thread.sleep(nanos / 1_000_000, (nanos % 1_000_000).toInt()) }
 private fun InetAddress.numeric(): String = if (address.size == 4) IpAddress.format4(address) else IpAddress.format6(address)
 internal actual fun resolveHost(host: String): List<String> {
     val pending = resolver.submit<Array<InetAddress>> { InetAddress.getAllByName(host) }

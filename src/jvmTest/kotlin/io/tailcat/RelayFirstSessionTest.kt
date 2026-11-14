@@ -718,6 +718,25 @@ class RelayFirstSessionTest {
         }
     }
 
+    @Test fun backToBackSendsArePacedAfterABurst() {
+        LocalRelay().use { fixture ->
+            val transport = DerpTransport(fixture.region.nodes, NodePrivateKey.generate(), true) { }
+            try {
+                transport.start(5000)
+                val destination = NodePrivateKey.generate().publicKey
+                // 100 frames of 1,317 bytes leave at 100 Mbit/s after the 5,600-byte burst.
+                val frames = List(100) { index -> ByteArray(1280).also { it[0] = 4; it[1] = index.toByte() } }
+                val started = System.nanoTime()
+                for (frame in frames) transport.send(destination, frame)
+                while (fixture.packets.count { it.size == 1280 } < 100) { check(System.nanoTime() - started < 5_000_000_000) { "All 100 reach the relay" }; Thread.onSpinWait() }
+                val nanos = System.nanoTime() - started
+                println("PACED-100 ${nanos / 1000}us")
+                assertTrue(nanos >= (100 * 1317 - 5600) * 1_000_000_000L / 12_500_000, "Paced: ${nanos / 1000}us")
+                assertEquals(frames.map { it[1] }, fixture.packets.filter { it.size == 1280 }.map { it[1] })
+            } finally { transport.close() }
+        }
+    }
+
     @Test fun realDerpMarkerBarrierPreservesPriorityAndAllowsRekeyControlAndOtherPeers() {
         LocalRelay().use { fixture ->
             val identity = NodePrivateKey.generate()

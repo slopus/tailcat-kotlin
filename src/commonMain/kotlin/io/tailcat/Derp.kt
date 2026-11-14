@@ -11,6 +11,10 @@ internal data class DerpFrame(val type: Int, val payload: ByteArray) {
     companion object { const val MAXIMUM = (1 shl 20) + 64 }
 }
 
+/** What the writer sends to the relay at most, in bytes a second, past a burst of four full packets. */
+private const val PACE_RATE = 12_500_000.0
+private const val PACE_BURST = 5600.0
+
 /** One reader and one bounded writer, with node failover and authenticated reconnect. */
 internal class DerpTransport(
     nodes: List<DERPNode>,
@@ -38,6 +42,9 @@ internal class DerpTransport(
     private var rate = 0.0
     private var burst = 0.0
     private var tokens = 0.0
+    // The writer's pacing, its own: bytes it may send at once, and when they were counted.
+    private var paceTokens = 0.0
+    private var paceAt = monotonicNanos()
     private var tokenAt = monotonicMillis()
     private val queue = ArrayDeque<DerpFrame>()
     private val resetMarkers = linkedMapOf<NodePublicKey, DerpFrame>()
@@ -260,6 +267,7 @@ internal class DerpTransport(
                     }
                     if (wait < 0) break
                     if (wait == 0L) {
+                        pace(size)
                         // Commit selection before I/O without holding the state lock across a socket write.
                         // A reset can cancel a not-yet-committed write; already committed prior work may finish.
                         val current = lock.withLock { !closed && ready && generation == work.second && nextWrite() === work.third }
@@ -278,6 +286,16 @@ internal class DerpTransport(
                 }
             } catch (_: Exception) { work.first.close() }
         }
+    }
+    /**
+     * Spaces bursts to 100 Mbit/s after four full packets. The relay queues 32 packets per destination
+     * and drops the oldest past that, so a TCP flight written all at once loses its head; without SACK,
+     * each loss costs a round trip.
+     */
+    private fun pace(size: Int) {
+        val now = monotonicNanos()
+        paceTokens = minOf(PACE_BURST, paceTokens + (now - paceAt) * PACE_RATE / 1e9) - size; paceAt = now
+        if (paceTokens < 0) platformSleepNanos((-paceTokens / PACE_RATE * 1e9).toLong())
     }
     private fun establish(connection: PlatformStream, node: DERPNode) {
         val host = node.ipv4.takeIf { it.isNotEmpty() && it != "none" }
