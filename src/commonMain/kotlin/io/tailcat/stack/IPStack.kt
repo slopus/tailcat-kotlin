@@ -93,6 +93,8 @@ class IPStack(
         var writeClosed = false; var applicationClosedAt: Long? = null; var finSequence: Long? = null
         var finAcknowledged = false; var readEOF = false; var lastActivity = now; var persistSent = now - 1000
         var finishedAt: Long? = null; var error: Throwable? = null
+        /** The right edge of the window last advertised: the peer may send up to it. */
+        var advertisedEdge = 0L
     }
     private class ListenerState(val id: Long, val port: Int) { val pending = ArrayDeque<Long>() }
     private enum class UDPMode { RAW, LISTENER, CONNECTED }
@@ -351,8 +353,26 @@ class IPStack(
         state.finSequence?.let { if (before(it, ack)) { state.finAcknowledged = true; if (state.readEOF) state.finishedAt = monotonicMillis() } }
     }
     private fun receiveWindow(state: TCPState): Int = maxOf(0, receiveCapacity - state.buffer.size - state.incomingBytes)
-    /** The window field for a segment: scaled down, and never scaled in a SYN (RFC 7323 2.2). */
-    private fun advertise(state: TCPState, syn: Boolean = false): Int = minOf(65535, receiveWindow(state) shr if (syn) 0 else state.receiveScale)
+    private fun advertisableWindow(state: TCPState, syn: Boolean = false): Int {
+        val shift = if (syn) 0 else state.receiveScale
+        return minOf(65535, receiveWindow(state) shr shift) shl shift
+    }
+    /** The window field for a segment carrying RCV.NXT, recording the edge it promises: scaled down, and never scaled in a SYN (RFC 7323 2.2). */
+    private fun advertise(state: TCPState, syn: Boolean = false): Int {
+        val window = advertisableWindow(state, syn); state.advertisedEdge = add(state.receiveNext, window)
+        return window shr if (syn) 0 else state.receiveScale
+    }
+    /**
+     * Whether the window opened enough to tell the peer: by half the buffer, or by a segment once the peer
+     * has less than two left to send (RFC 1122 4.2.3.3). Each read used to send its own update.
+     */
+    private fun windowUpdateDue(state: TCPState): Boolean {
+        val window = advertisableWindow(state)
+        val promised = if (before(state.advertisedEdge, state.receiveNext)) 0 else distance(state.advertisedEdge, state.receiveNext).toInt()
+        if (window <= promised) return false
+        val opened = window - promised
+        return opened >= receiveCapacity / 2 || (promised < 2 * state.mss && opened >= state.mss)
+    }
     private fun ingest(state: TCPState, sequence: Long, payload: ByteArray, fin: Boolean) {
         if (state.readEOF) return
         var seq = sequence; var data = payload
@@ -428,7 +448,7 @@ class IPStack(
         checkBounds(buffer, offset, length); if (length == 0) return@locked 0; val until = deadline(timeoutMillis)
         while (true) {
             val state = state(id); if (state.applicationClosedAt != null) throw error(TailcatTransportException.Reason.CLOSED)
-            if (state.buffer.size > 0) { val count = state.buffer.read(buffer, offset, length); sendACK(state); return@locked count }
+            if (state.buffer.size > 0) { val count = state.buffer.read(buffer, offset, length); if (windowUpdateDue(state)) sendACK(state); return@locked count }
             if (state.readEOF) return@locked -1; await(until)
         }
         @Suppress("UNREACHABLE_CODE") -1

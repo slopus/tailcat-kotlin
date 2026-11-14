@@ -113,6 +113,21 @@ class StackTest {
             writer.await(); assertEquals(900_000, total)
         } finally { link.close() }
     }
+    @Test fun readingABufferedResponseSendsNoWindowUpdatePerRead() {
+        val link = Link()
+        try {
+            val listener = link.second.listen(87); val client = link.first.connect(b,87); val server = listener.accept(10000)
+            val response = ByteArray(20_000) { (it * 7).toByte() }
+            // Returns once the client has acknowledged every byte: all of it is buffered.
+            server.write(response, timeoutMillis = 10000); server.closeWrite(10000); platformSleep(200)
+            val before = link.acks()
+            val received = ArrayList<Byte>()
+            while (true) { val chunk = client.read(1000, 10000); if (chunk.isEmpty()) break; received.addAll(chunk.toList()) }
+            assertContentEquals(response, received.toByteArray())
+            // The window never ran low, so the peer is told nothing it needs.
+            assertTrue(link.acks() - before <= 1, "Window updates: ${link.acks() - before}")
+        } finally { link.close() }
+    }
     /** A segment from a peer at [a] port 48 to [b] port 80, with an MSS option when [mss] is set. */
     private fun segment(sequence: Long, ack: Long, flags: Int, window: Int, mss: Boolean = false): ByteArray {
         val body = ByteArray(if (mss) 24 else 20); body[1] = 0x30; body[3] = 80
@@ -262,18 +277,19 @@ class StackTest {
         } finally { link.close() }
     }
     @Test fun orderlyClosureKeepsEOFAfterLateReset() {
-        val link = Link()
+        val link = Link(capacity = 65535)
         try {
             val listener = link.second.listen(85); val client = link.first.connect(b,85); val server = listener.accept(10000)
-            val request = "small request".encodeToByteArray(); val response = ByteArray(4096) { (it*19).toByte() }
+            // Nearly the whole receive window, so that reading reopens it by more than a segment
+            // while the peer has less than two left to send.
+            val request = "small request".encodeToByteArray(); val response = ByteArray(64_000) { (it*19).toByte() }
             client.write(request,timeoutMillis=10000); client.shutdownOutput(10000)
             assertContentEquals(request,server.read(request.size,10000)); assertTrue(server.read(1,10000).isEmpty())
             server.write(response,timeoutMillis=10000); server.shutdownOutput(10000)
             server.abort() // Forget the completed peer; the next window ACK elicits RST.
-            assertContentEquals(response.copyOfRange(0,1024),client.read(1024,10000))
+            assertContentEquals(response.copyOfRange(0,4096),client.read(4096,10000))
             link.waitReset()
-            assertContentEquals(response.copyOfRange(1024,response.size),client.read(response.size,10000))
-            assertTrue(client.read(1,10000).isEmpty())
+            assertContentEquals(response.copyOfRange(4096,response.size),drain(client))
         } finally { link.close() }
     }
     @Test fun zeroWindowAndLostFinAck() {
