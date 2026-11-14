@@ -113,26 +113,58 @@ class StackTest {
             writer.await(); assertEquals(900_000, total)
         } finally { link.close() }
     }
+    /** A segment from a peer at [a] port 48 to [b] port 80, with an MSS option when [mss] is set. */
+    private fun segment(sequence: Long, ack: Long, flags: Int, window: Int, mss: Boolean = false): ByteArray {
+        val body = ByteArray(if (mss) 24 else 20); body[1] = 0x30; body[3] = 80
+        be32(sequence).copyInto(body, 4); be32(ack).copyInto(body, 8)
+        body[12] = ((body.size / 4) shl 4).toByte(); body[13] = flags.toByte(); body[14] = (window ushr 8).toByte(); body[15] = window.toByte()
+        if (mss) { body[20] = 2; body[21] = 4; body[22] = 0x04; body[23] = 0xc4.toByte() }
+        var sum = body.size.toLong() + 6
+        for (i in 0 until 16 step 2) sum += a.be16(i) + b.be16(i)
+        for (i in body.indices step 2) sum += body.be16(i)
+        while (sum ushr 16 != 0L) sum = (sum and 65535) + (sum ushr 16)
+        val checksum = sum.toInt().inv() and 65535; body[16] = (checksum ushr 8).toByte(); body[17] = checksum.toByte()
+        val packet = ByteArray(40 + body.size); packet[0] = 0x60; packet[5] = body.size.toByte(); packet[6] = 6; packet[7] = 64
+        a.copyInto(packet, 8); b.copyInto(packet, 24); body.copyInto(packet, 40)
+        return packet
+    }
     @Test fun aPeerThatOffersNoWindowScaleGetsUnscaledWindows() {
         val sent = ArrayList<ByteArray>()
         val stack = IPStack(b, { sent.add(it) })
         try {
             stack.listen(80)
             // A SYN with only an MSS option, from a peer that doesn't scale.
-            val body = ByteArray(24); body[1] = 0x30; body[3] = 80; body[7] = 1; body[12] = 0x60; body[13] = 2; body[14] = 0xff.toByte(); body[15] = 0xff.toByte()
-            body[20] = 2; body[21] = 4; body[22] = 0x04; body[23] = 0xc4.toByte()
-            var sum = body.size.toLong() + 6
-            for (i in 0 until 16 step 2) sum += a.be16(i) + b.be16(i)
-            for (i in body.indices step 2) sum += body.be16(i)
-            while (sum ushr 16 != 0L) sum = (sum and 65535) + (sum ushr 16)
-            val checksum = sum.toInt().inv() and 65535; body[16] = (checksum ushr 8).toByte(); body[17] = checksum.toByte()
-            val packet = ByteArray(40 + body.size); packet[0] = 0x60; packet[5] = body.size.toByte(); packet[6] = 6; packet[7] = 64
-            a.copyInto(packet, 8); b.copyInto(packet, 24); body.copyInto(packet, 40)
-            stack.receive(packet)
+            stack.receive(segment(1, 0, 2, 65535, mss = true))
             val synAck = sent.single()
             assertEquals(0x12, synAck[53].u() and 0x12)
             assertEquals(24, (synAck[52].u() ushr 4) * 4, "No window scale option in the SYN-ACK")
             assertEquals(65535, synAck.be16(54))
+        } finally { stack.close() }
+    }
+    @Test fun aWindowOpeningBytesAtATimeWaitsForAFullSegmentWhileAnACKIsDue() {
+        val lock = PlatformLock(); val sent = ArrayList<ByteArray>()
+        val stack = IPStack(b, { lock.withLock { sent.add(it); lock.signalAll() } })
+        fun payloads(): List<Int> = lock.withLock { sent.map { it.size - 40 - (it[52].u() ushr 4) * 4 }.filter { it > 0 } }
+        fun awaitPayload(total: Int) = lock.withLock {
+            val end = monotonicMillis() + 5000
+            while (payloads().sum() < total) { val left = end - monotonicMillis(); check(left > 0) { "Sent ${'$'}{payloads()}" }; lock.await(left) }
+        }
+        try {
+            val listener = stack.listen(80)
+            stack.receive(segment(1, 0, 2, 2440, mss = true))
+            val start = lock.withLock { sent.single() }.be32(44) + 1
+            stack.receive(segment(2, start, 0x10, 2440))
+            val server = listener.accept(5000)
+            val writer = Job { server.write(ByteArray(10_000), timeoutMillis = 30000) }
+            awaitPayload(2440)
+            // The first segment is acknowledged and the window opens ten bytes past the second.
+            stack.receive(segment(2, start + 1220, 0x10, 1230))
+            platformSleep(200)
+            assertEquals(listOf(1220, 1220), payloads(), "No ten-byte segment while the second is in flight")
+            stack.receive(segment(2, start + 2440, 0x10, 2440))
+            awaitPayload(4880)
+            assertEquals(listOf(1220, 1220, 1220, 1220), payloads())
+            stack.close(); runCatching { writer.await(5000) }
         } finally { stack.close() }
     }
     @Test fun abortStopsThePeersWriteAtOnce() {

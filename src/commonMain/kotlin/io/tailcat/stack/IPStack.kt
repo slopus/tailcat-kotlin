@@ -401,7 +401,11 @@ class IPStack(
             while (write.offset < write.data.size) {
                 val inFlight = distance(state.sendNext, state.sendUnacknowledged).toInt(); val allowed = minOf(state.remoteWindow, state.congestionWindow) - inFlight
                 if (allowed <= 0) return
-                val count = minOf(state.mss, allowed, write.data.size - write.offset); val bytes = write.data.copyOfRange(write.offset, write.offset + count)
+                val remaining = write.data.size - write.offset; val count = minOf(state.mss, allowed, remaining)
+                // RFC 1122 4.2.3.4: while an ACK is due, wait for a full segment's window rather than split
+                // segments as the window opens bytes at a time.
+                if (count < minOf(state.mss, remaining) && inFlight > 0) return
+                val bytes = write.data.copyOfRange(write.offset, write.offset + count)
                 write.offset += count; transmit(state, 0x18, bytes)
             }
             if (write.end == null) write.end = state.sendNext
