@@ -93,6 +93,27 @@ class CryptoTest {
         e.receive(fc,mono); f.receive(ec,mono)
         eq(e.receive(f.encrypt(ip(8),mono),mono).plaintext!!,ip(8)); eq(f.receive(e.encrypt(ip(9),mono),mono).plaintext!!,ip(9))
     }
+    @Test fun ourAnsweredInitiationOutranksTheCrossedOneWeAnsweredBeforeIt() {
+        // b sent an initiation while a was suspended. On waking, a initiates and answers b's.
+        // wireguard-go can take a's response even after answering a's initiation, which
+        // dropped its own initiation's index: it sends on the session a answered, yet never
+        // reads it again. a must stay on the session of its own initiation.
+        val (a,b) = peers(); establish(a,b)
+        val later = mono+20000; val now = later+5000
+        val crossed = b.initiate(later,wall+20000)
+        val initiation = a.initiate(now,wall+25000)
+        val answer = a.receive(crossed,now).response!!
+        val response = b.receive(initiation,now).response!!
+        val onCrossed = b.receive(answer,now).response!!
+        val confirmation = a.receive(response,now).response!!
+        assertFalse(a.receive(onCrossed,now).handshakeCompleted)
+        val data = a.encrypt(ip(7),now)
+        eq(data.copyOfRange(4,8),response.copyOfRange(4,8)); assertFalse(data.copyOfRange(4,8).contentEquals(crossed.copyOfRange(4,8)))
+        // b crossed too, and likewise stays on its own initiation's session: each reads the other's.
+        assertFalse(b.receive(confirmation,now).handshakeCompleted)
+        eq(b.receive(data,now).plaintext!!,ip(7))
+        eq(a.receive(b.encrypt(ip(8),now),now).plaintext!!,ip(8))
+    }
     @Test fun cookiesAndWindow() {
         val (a,b) = peers(); val source = byteArrayOf(100,64,0,1,0x12,0x34)
         val challenge = b.receive(a.initiate(mono,wall),mono,source,true).response!!; assertEquals(3,WG.packetType(challenge))

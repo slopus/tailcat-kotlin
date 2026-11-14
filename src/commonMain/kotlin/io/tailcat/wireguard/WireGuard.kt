@@ -16,7 +16,9 @@ internal class WireGuard(privateKey: ByteArray,peerPublicKey: ByteArray,preshare
     }
     private data class Initiation(val chain: ByteArray,val hash: ByteArray,val ephemeral: ByteArray,val localIndex: UInt,val created: Long)
     private data class Outbound(val packet: ByteArray,val localIndex: UInt,val created: Long)
-    private data class Session(val sendKey: ByteArray,val receiveKey: ByteArray,val localIndex: UInt,val remoteIndex: UInt,val created: Long,val initiator: Boolean,var sendCounter: ULong=0UL,var replay: ReplayWindow=ReplayWindow())
+    /** [promotes]: whether the peer's first packet on it, as [next], makes it current: not once our own later initiation was
+     * answered. The peer may still send on it, as wireguard-go does when its initiation crossed ours, but we stay on the newer session. */
+    private data class Session(val sendKey: ByteArray,val receiveKey: ByteArray,val localIndex: UInt,val remoteIndex: UInt,val created: Long,val initiator: Boolean,var sendCounter: ULong=0UL,var replay: ReplayWindow=ReplayWindow(),var promotes: Boolean=true)
     private var pending: Initiation?=null; private var previous: Session?=null; private var current: Session?=null; private var next: Session?=null
     private var lastTimestamp: ByteArray?=null; private var lastSentTimestamp: ByteArray?=null; private var lastInitiationReceived: Long?=null
     private var lastOutbound: Outbound?=null; private var cookie: ByteArray?=null; private var cookieReceivedAt: Long?=null
@@ -99,18 +101,18 @@ internal class WireGuard(privateKey: ByteArray,peerPublicKey: ByteArray,preshare
         val ephemeral=packet.copyOfRange(12,44); var hash=hash(initiation.hash,ephemeral); var chain=kdf(initiation.chain,ephemeral,1)[0]
         chain=kdf(chain,Crypto.sharedSecret(initiation.ephemeral,ephemeral),1)[0]; chain=kdf(chain,Crypto.sharedSecret(privateKey,ephemeral),1)[0]
         val keys=kdf(chain,presharedKey,3); hash=hash(hash,keys[1]); Crypto.open(packet.copyOfRange(44,60),keys[2],zeroNonce,hash)
-        val transportKeys=kdf(keys[0],byteArrayOf(),2); previous=current
+        val transportKeys=kdf(keys[0],byteArrayOf(),2); previous=current; next?.promotes=false
         current=Session(transportKeys[0],transportKeys[1],initiation.localIndex,u32(packet,4),now,true); pending=null
         return ReceiveResult(response=encrypt(byteArrayOf(),now),handshakeCompleted=true)
     }
     private fun consumeTransport(packet: ByteArray,now: Long): ReceiveResult {
         if (packet.size !in 32..65568) fail(Failure.INVALID_PACKET)
         val index=u32(packet,4); val counter=u64(packet,8); val slot: Int; val session: Session
-        when { next?.localIndex==index -> { session=next!!; slot=2 }; current?.localIndex==index -> { session=current!!; slot=1 }; previous?.localIndex==index -> { session=previous!!; slot=0 }; else -> fail(Failure.UNEXPECTED_MESSAGE) }
+        when { next?.localIndex==index -> { session=next!!; slot=if (session.promotes) 2 else 3 }; current?.localIndex==index -> { session=current!!; slot=1 }; previous?.localIndex==index -> { session=previous!!; slot=0 }; else -> fail(Failure.UNEXPECTED_MESSAGE) }
         if (!alive(now,session.created,180_000)) fail(Failure.EXPIRED)
         val replay=session.replay.copy(); if (!replay.accept(counter)) fail(Failure.REPLAY)
         val padded=Crypto.open(packet.copyOfRange(16,packet.size),session.receiveKey,nonce(counter)); session.replay=replay
-        when(slot) { 2 -> { previous=current; current=session; next=null }; 1 -> current=session; else -> previous=session }
+        when(slot) { 2 -> { previous=current; current=session; next=null }; 3 -> next=session; 1 -> current=session; else -> previous=session }
         return ReceiveResult(plaintext=unpadIP(padded),handshakeCompleted=slot==2)
     }
     private fun consumeCookie(packet: ByteArray,now: Long): ReceiveResult {

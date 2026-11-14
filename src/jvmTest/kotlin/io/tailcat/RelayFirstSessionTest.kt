@@ -673,6 +673,49 @@ class RelayFirstSessionTest {
         }
     }
 
+    @Test fun aHandshakeCrossedWithTheServersOwnNeedsNoRejoin() {
+        LocalRelay().use { relay ->
+            val key = NodePrivateKey.generate(); val psk = PresharedKey.generate()
+            val server = TailcatServer(ServerConfiguration(privateKey = key, presharedKey = psk, region = relay.region,
+                testOnlyPlaintextDERP = true, relayFirst = true, onTCP = { echo }))
+            val address = server.start()
+            val client = TailcatClient.connect(address, ClientConfiguration(testOnlyPlaintextDERP = true, relayFirst = true))
+            try {
+                val connection = client.dialTCP(80)
+                try {
+                    exchange(connection, "before")
+                    // The server's own initiation, sent while the client was suspended, crosses the one the
+                    // client sends on waking. wireguard-go can take the client's answer to it after answering
+                    // the client's initiation, then sends on the session that answer made but reads nothing
+                    // on it: answering dropped its index. `crossed` is that session's server end.
+                    val crossed = WireGuard(key.raw, client.publicKey.raw, psk.raw)
+                    val answer = java.util.concurrent.atomic.AtomicReference<ByteArray?>()
+                    val response = java.util.concurrent.atomic.AtomicReference<ByteArray?>()
+                    relay.dropped = { source, packet ->
+                        (WireGuard.packetType(packet) == 2).also { if (it) (if (source == server.publicKey) response else answer).compareAndSet(null, packet) }
+                    }
+                    fun initiations() = relay.sourcedPackets.count { it.first == client.publicKey && WireGuard.packetType(it.second) == 1 }
+                    // The client initiates; the server's initiation reaches it before the answer.
+                    relay.inject(server.publicKey, client.publicKey, meowAgain)
+                    eventually("The server answers") { response.get() != null }
+                    relay.inject(server.publicKey, client.publicKey, crossed.initiate(System.nanoTime() / 1_000_000))
+                    eventually("The client answers the crossed initiation") { answer.get() != null }
+                    relay.inject(server.publicKey, client.publicKey, response.get()!!)
+                    Thread.sleep(300)
+                    relay.inject(server.publicKey, client.publicKey, crossed.receive(answer.get()!!, System.nanoTime() / 1_000_000).response!!)
+                    Thread.sleep(300)
+                    relay.dropped = null
+                    val before = initiations(); val started = System.nanoTime()
+                    exchange(connection, "after crossing")
+                    val millis = (System.nanoTime() - started) / 1_000_000
+                    // Answered well inside the five seconds after which data owed would rejoin.
+                    assertTrue(millis < 2000, "Answered on the session the client's initiation made: ${millis}ms")
+                    assertEquals(before, initiations(), "No further initiation")
+                } finally { relay.dropped = null; connection.close() }
+            } finally { client.close(); server.close() }
+        }
+    }
+
     @Test fun aCheckWaitsThreeOfTheRelaysRoundTripsAtLeastASecond() {
         LocalRelay().use { relay ->
             RestartableServer(relay, echo).use { restartable ->
