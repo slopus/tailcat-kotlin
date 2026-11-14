@@ -673,6 +673,25 @@ class RelayFirstSessionTest {
         }
     }
 
+    @Test fun aClientUnansweredForThirtySecondsKeepsItsServer() {
+        LocalRelay().use { relay ->
+            val server = TailcatServer(ServerConfiguration(region = relay.region, testOnlyPlaintextDERP = true, relayFirst = true, onTCP = { echo }))
+            val address = server.start()
+            // The server's answers are lost for 31 s, as to an app suspended before the first came:
+            // the client stays unauthenticated past the 30 s after which a server evicts a peer.
+            val lostUntil = System.nanoTime() + TimeUnit.SECONDS.toNanos(31)
+            relay.dropped = { source, packet -> source == server.publicKey && WireGuard.packetType(packet) == 2 && System.nanoTime() < lostUntil }
+            try {
+                val started = System.nanoTime()
+                val client = TailcatClient.connect(address, ClientConfiguration(testOnlyPlaintextDERP = true, relayFirst = true, connectTimeoutMillis = 45_000))
+                try {
+                    assertTrue((System.nanoTime() - started) / 1_000_000 < 35_000, "Connected on the first answer after the loss")
+                    client.dialTCP(80, 10_000).let { try { exchange(it, "after the loss") } finally { it.close() } }
+                } finally { client.close() }
+            } finally { relay.dropped = null; server.close() }
+        }
+    }
+
     @Test fun aHandshakeCrossedWithTheServersOwnNeedsNoRejoin() {
         LocalRelay().use { relay ->
             val key = NodePrivateKey.generate(); val psk = PresharedKey.generate()

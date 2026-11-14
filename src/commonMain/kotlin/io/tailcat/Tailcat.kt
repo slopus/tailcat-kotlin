@@ -542,7 +542,8 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
         if (!server) { if (stack.retransmitting) owedSince = owedSince ?: now else owedSince = null }
         selected.entries.removeAll { now - it.value.time > 60_000 }
         for ((key, peer) in peers.toMap()) {
-            if ((!peer.authenticated && now - peer.created > 30_000) || (server && peer.authenticated && now - peer.lastReceived > 300_000)) { removePeer(key); continue }
+            // Only a server evicts: a client's one peer is its server, and nothing would add it back.
+            if (server && ((!peer.authenticated && now - peer.created > 30_000) || (peer.authenticated && now - peer.lastReceived > 300_000))) { removePeer(key); continue }
             try {
                 peer.wg.maintenance(now)
                 prepareResetMarker(key, peer)
