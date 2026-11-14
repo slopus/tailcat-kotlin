@@ -161,6 +161,11 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
         var sentSinceReceived: Long? = null
         /** Data came in with nothing sent since: WireGuard's passive keepalive answers it. */
         var receivedSinceSent: Long? = null
+        /** The server has sent on a session of ours: it holds the keypair we send on. */
+        var heard = false
+        /** When data first went on a session the server has yet to send on: the server may hold
+         * another keypair for our initiation. [refreshed] once a fresh initiation was sent for it. */
+        var unansweredSince: Long? = null; var refreshed = false
     }
     private sealed class Event {
         class Incoming(val key: NodePublicKey, val packet: ByteArray, val relay: Boolean) : Event()
@@ -338,6 +343,7 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
         val rejoined = result.handshakeCompleted && peer.rejoining
         if (result.handshakeCompleted) { trace?.markOnce("wgEstablished"); peer.rejoining = false }
         result.response?.let { sendPeerPacket(key, peer, it); peer.lastSend = now; peer.receivedSinceSent = null }
+        if (WireGuard.packetType(packet) == 4) peer.heard = true
         if (result.handshakeCompleted || WireGuard.packetType(packet) == 4) {
             peer.authenticated = true; peer.lastReceived = now
             network.authenticated(key)
@@ -461,6 +467,7 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
         sendPeerPacket(key, peer, peer.wg.encrypt(packet, now))
         peer.lastSend = now; peer.receivedSinceSent = null
         if (packet.isNotEmpty() && peer.sentSinceReceived == null) peer.sentSinceReceived = now
+        if (packet.isNotEmpty() && !peer.heard && peer.unansweredSince == null) peer.unansweredSince = now
     }
     private fun deliverServerIP(ip: ByteArray) {
         val destination = ip.copyOfRange(24, 40); val source = ip.copyOfRange(8, 24)
@@ -559,8 +566,12 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
                 // Data waiting on a handshake retries it each second, not five: an initiation lost to a
                 // relay that died during a suspension otherwise holds that data for five seconds.
                 // So does a rejoin, which keeps the old session in use until a new one replaces it.
-                val spacing = if ((!peer.wg.isEstablished && peer.pending.isNotEmpty()) || peer.rejoining) 1000 else 5000
-                if (peer.acknowledged && (!peer.wg.isEstablished || peer.rejoining || peer.wg.needsRekey(now)) && now - peer.lastHandshake >= spacing && (!server || peer.wg.isEstablished)) {
+                // Unanswered for a second: a server that took two copies of our initiation may keep
+                // the keypair whose answer was lost. One fresh initiation, which it can take only once.
+                val unanswered = !server && !peer.heard && !peer.refreshed && peer.wg.isEstablished && peer.unansweredSince?.let { now - it >= 1000 } == true
+                val spacing = if ((!peer.wg.isEstablished && peer.pending.isNotEmpty()) || peer.rejoining || unanswered) 1000 else 5000
+                if (peer.acknowledged && (!peer.wg.isEstablished || peer.rejoining || unanswered || peer.wg.needsRekey(now)) && now - peer.lastHandshake >= spacing && (!server || peer.wg.isEstablished)) {
+                    if (unanswered) peer.refreshed = true
                     peer.lastHandshake = now; sendPeerPacket(key, peer, peer.wg.initiate(now))
                     trace?.markOnce("wgInitiationQueued")
                 } else if (peer.wg.isEstablished && peer.receivedSinceSent?.let { now - it >= 10_000 } == true) {

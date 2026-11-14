@@ -19,6 +19,9 @@ internal class WireGuard(privateKey: ByteArray,peerPublicKey: ByteArray,preshare
     /** [promotes]: whether the peer's first packet on it, as [next], makes it current: not once our own later initiation was
      * answered. The peer may still send on it, as wireguard-go does when its initiation crossed ours, but we stay on the newer session. */
     private data class Session(val sendKey: ByteArray,val receiveKey: ByteArray,val localIndex: UInt,val remoteIndex: UInt,val created: Long,val initiator: Boolean,var sendCounter: ULong=0UL,var replay: ReplayWindow=ReplayWindow(),var promotes: Boolean=true)
+    /** The initiation [current] came from, and who answered it, until the peer has used it: a responder that
+     * took two copies of it answers twice and keeps only the later keypair. */
+    private var answered: Pair<Initiation,Set<UInt>>?=null
     private var pending: Initiation?=null; private var previous: Session?=null; private var current: Session?=null; private var next: Session?=null
     private var lastTimestamp: ByteArray?=null; private var lastSentTimestamp: ByteArray?=null; private var lastInitiationReceived: Long?=null
     private var lastOutbound: Outbound?=null; private var cookie: ByteArray?=null; private var cookieReceivedAt: Long?=null
@@ -53,7 +56,7 @@ internal class WireGuard(privateKey: ByteArray,peerPublicKey: ByteArray,preshare
         }
         val encryptedTimestamp=Crypto.seal(timestamp,keys[1],zeroNonce,hash); hash=hash(hash,encryptedTimestamp)
         val packet=addMACs(le(1U)+le(index)+ephemeralPublic+encryptedStatic+encryptedTimestamp,nowMillis)
-        lastSentTimestamp=timestamp; pending=Initiation(chain,hash,ephemeral,index,nowMillis); lastOutbound=Outbound(packet.copyOf(),index,nowMillis)
+        lastSentTimestamp=timestamp; pending=Initiation(chain,hash,ephemeral,index,nowMillis); answered=null; lastOutbound=Outbound(packet.copyOf(),index,nowMillis)
         return packet
     }
     fun receive(datagram: ByteArray,nowMillis: Long,source: ByteArray?=null,requireCookie: Boolean=false): ReceiveResult {
@@ -95,14 +98,21 @@ internal class WireGuard(privateKey: ByteArray,peerPublicKey: ByteArray,preshare
         lastOutbound=Outbound(response.copyOf(),localIndex,now); return ReceiveResult(response=response)
     }
     private fun consumeResponse(packet: ByteArray,now: Long): ReceiveResult {
-        val initiation=pending ?: fail(Failure.UNEXPECTED_MESSAGE)
-        if (u32(packet,8)!=initiation.localIndex) fail(Failure.UNEXPECTED_MESSAGE)
+        val responder=u32(packet,4); val candidate=pending; val earlier=answered
+        val initiation=when {
+            candidate!=null && u32(packet,8)==candidate.localIndex -> candidate
+            earlier!=null && u32(packet,8)==earlier.first.localIndex && responder !in earlier.second && now-earlier.first.created<5000 -> earlier.first
+            else -> fail(Failure.UNEXPECTED_MESSAGE)
+        }
         if (!alive(now,initiation.created,180_000)) fail(Failure.EXPIRED)
         val ephemeral=packet.copyOfRange(12,44); var hash=hash(initiation.hash,ephemeral); var chain=kdf(initiation.chain,ephemeral,1)[0]
         chain=kdf(chain,Crypto.sharedSecret(initiation.ephemeral,ephemeral),1)[0]; chain=kdf(chain,Crypto.sharedSecret(privateKey,ephemeral),1)[0]
         val keys=kdf(chain,presharedKey,3); hash=hash(hash,keys[1]); Crypto.open(packet.copyOfRange(44,60),keys[2],zeroNonce,hash)
-        val transportKeys=kdf(keys[0],byteArrayOf(),2); previous=current; next?.promotes=false
-        current=Session(transportKeys[0],transportKeys[1],initiation.localIndex,u32(packet,4),now,true); pending=null
+        val transportKeys=kdf(keys[0],byteArrayOf(),2)
+        // A later answer replaces the session it shares an index with; the responder dropped that one.
+        if (pending!=null) { previous=current; next?.promotes=false }
+        current=Session(transportKeys[0],transportKeys[1],initiation.localIndex,responder,now,true)
+        answered=initiation to (earlier?.second.orEmpty()+responder); pending=null
         return ReceiveResult(response=encrypt(byteArrayOf(),now),handshakeCompleted=true)
     }
     private fun consumeTransport(packet: ByteArray,now: Long): ReceiveResult {
@@ -112,6 +122,7 @@ internal class WireGuard(privateKey: ByteArray,peerPublicKey: ByteArray,preshare
         if (!alive(now,session.created,180_000)) fail(Failure.EXPIRED)
         val replay=session.replay.copy(); if (!replay.accept(counter)) fail(Failure.REPLAY)
         val padded=Crypto.open(packet.copyOfRange(16,packet.size),session.receiveKey,nonce(counter)); session.replay=replay
+        if (slot==1 || slot==2) answered=null
         when(slot) { 2 -> { previous=current; current=session; next=null }; 3 -> next=session; 1 -> current=session; else -> previous=session }
         return ReceiveResult(plaintext=unpadIP(padded),handshakeCompleted=slot==2)
     }

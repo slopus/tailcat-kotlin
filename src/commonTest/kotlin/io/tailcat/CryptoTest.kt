@@ -93,6 +93,21 @@ class CryptoTest {
         e.receive(fc,mono); f.receive(ec,mono)
         eq(e.receive(f.encrypt(ip(8),mono),mono).plaintext!!,ip(8)); eq(f.receive(e.encrypt(ip(9),mono),mono).plaintext!!,ip(9))
     }
+    @Test fun aSecondAnswerToTheSameInitiationReplacesTheSessionTheResponderDropped() {
+        // A responder that took two copies of one initiation at once answers twice and keeps the later keypair.
+        val (a,b) = peers(); val kept = peers().second; val third = peers().second
+        val initiation = a.initiate(mono,wall)
+        val first = b.receive(initiation,mono).response!!; val second = kept.receive(initiation,mono).response!!
+        assertTrue(a.receive(first,mono).handshakeCompleted)
+        val adopted = a.receive(second,mono); assertTrue(adopted.handshakeCompleted)
+        assertTrue(kept.receive(adopted.response!!,mono).handshakeCompleted)
+        eq(kept.receive(a.encrypt(ip(1),mono),mono).plaintext!!,ip(1))
+        assertEquals(WG.Failure.UNEXPECTED_MESSAGE,assertFailsWith<WG.WireGuardException> { a.receive(first,mono) }.failure)
+        // Once the responder has used the session, no later answer replaces it.
+        val late = third.receive(initiation,mono).response!!
+        eq(a.receive(kept.encrypt(ip(2),mono),mono).plaintext!!,ip(2))
+        assertEquals(WG.Failure.UNEXPECTED_MESSAGE,assertFailsWith<WG.WireGuardException> { a.receive(late,mono) }.failure)
+    }
     @Test fun ourAnsweredInitiationOutranksTheCrossedOneWeAnsweredBeforeIt() {
         // b sent an initiation while a was suspended. On waking, a initiates and answers b's.
         // wireguard-go can take a's response even after answering a's initiation, which

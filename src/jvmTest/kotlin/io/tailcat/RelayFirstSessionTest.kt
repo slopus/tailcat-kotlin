@@ -552,13 +552,19 @@ class RelayFirstSessionTest {
 
     @Test fun dataUnansweredFor15SecondsMeowsAndHandshakesAgain() {
         LocalRelay().use { relay ->
-            RestartableServer(relay, echo).use { restartable ->
+            val reply: TailcatUDPHandler = { flow -> try { flow.send(flow.receive(10_000)) } finally { flow.close() } }
+            RestartableServer(relay, echo, reply).use { restartable ->
                 val client = TailcatClient.connect(restartable.address, ClientConfiguration(testOnlyPlaintextDERP = true, relayFirst = true))
                 try {
+                    // A session the server has answered on: one it never did gets a fresh initiation after a second.
+                    client.dialUDP(9).let { flow -> flow.send("ping".encodeToByteArray()); assertContentEquals("ping".encodeToByteArray(), flow.receive(10_000)) }
                     val before = meows(relay, client)
                     val initiations = relay.sourcedPackets.count { it.first == client.publicKey && WireGuard.packetType(it.second) == 1 }
-                    // A server that reads nothing we send and says nothing: no meow again, no TCP to time out.
+                    // A server that reads nothing we send and says nothing: no meow again, no TCP to time out,
+                    // and not the passive keepalive the exchange would draw.
                     relay.droppedTransportSource = client.publicKey
+                    val server = restartable.server.publicKey
+                    relay.dropped = { source, packet -> source == server && WireGuard.packetType(packet) == 4 }
                     val flow = client.dialUDP(9)
                     val sent = System.nanoTime()
                     flow.send("unanswered".encodeToByteArray())
@@ -570,7 +576,7 @@ class RelayFirstSessionTest {
                     eventually("And handshook again") {
                         relay.sourcedPackets.count { it.first == client.publicKey && WireGuard.packetType(it.second) == 1 } > initiations
                     }
-                    relay.droppedTransportSource = null
+                    relay.droppedTransportSource = null; relay.dropped = null
                     client.dialTCP(80, 10_000).let { try { exchange(it, "after the rejoin") } finally { it.close() } }
                 } finally { client.close() }
             }
@@ -687,6 +693,33 @@ class RelayFirstSessionTest {
                 try {
                     assertTrue((System.nanoTime() - started) / 1_000_000 < 35_000, "Connected on the first answer after the loss")
                     client.dialTCP(80, 10_000).let { try { exchange(it, "after the loss") } finally { it.close() } }
+                } finally { client.close() }
+            } finally { relay.dropped = null; server.close() }
+        }
+    }
+
+    @Test fun aSessionTheServerNeverAnswersGetsOneFreshInitiation() {
+        LocalRelay().use { relay ->
+            val server = TailcatServer(ServerConfiguration(region = relay.region, testOnlyPlaintextDERP = true, relayFirst = true, onTCP = { echo }))
+            val address = server.start()
+            // As if the server kept another keypair for our initiation: nothing it sends on ours
+            // arrives until we initiate again.
+            val handshook = AtomicInteger(); val connected = AtomicInteger(Int.MAX_VALUE)
+            relay.dropped = { source, packet ->
+                if (source != server.publicKey && WireGuard.packetType(packet) == 1) handshook.incrementAndGet()
+                source == server.publicKey && WireGuard.packetType(packet) == 4 && handshook.get() <= connected.get()
+            }
+            try {
+                val client = TailcatClient.connect(address, ClientConfiguration(testOnlyPlaintextDERP = true, relayFirst = true))
+                try {
+                    connected.set(handshook.get())
+                    val started = System.nanoTime()
+                    client.dialTCP(80, 10_000).let { try { exchange(it, "answered after one fresh initiation") } finally { it.close() } }
+                    val millis = (System.nanoTime() - started) / 1_000_000
+                    // A second unanswered, not the five of the owed-data rejoin.
+                    assertTrue(millis < 3000, "Answered after a fresh initiation: ${millis}ms")
+                    Thread.sleep(3000)
+                    assertEquals(connected.get() + 1, handshook.get(), "One fresh initiation, not one a second")
                 } finally { client.close() }
             } finally { relay.dropped = null; server.close() }
         }
