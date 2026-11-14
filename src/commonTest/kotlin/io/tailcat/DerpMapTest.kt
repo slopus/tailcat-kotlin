@@ -29,6 +29,14 @@ class DerpMapTest {
         assertEquals(listOf(302), stale.regions().map { it.regionID })
         assertFails { DERPMapProvider(unreachable).regions() }
     }
+    @Test fun aRegionMissingFromTheSavedMapIsFetched() {
+        var requests = 0
+        val current = """{"Regions":{"9":{"RegionID":9,"Nodes":[{"Name":"9a","RegionID":9,"HostName":"nine.example"}]}}}"""
+        val provider = DERPMapProvider(unreachable, cached(wallClockMillis())) { _, _, _, _ -> requests++; HttpResponse(200, emptyMap(), current.encodeToByteArray()) }
+        val region = provider.expand(TailcatAddress(NodePrivateKey.generate().publicKey, regionID = 9)).single()
+        assertEquals("nine.example", region.nodes.single().hostName)
+        assertEquals(1, requests)
+    }
     /** Opt-in: TAILCAT_LIVE_DERP_MAP=1 fetches the default map over the network. */
     @Test fun liveDefaultMap() {
         if (platformTestEnv("TAILCAT_LIVE_DERP_MAP") != "1") return

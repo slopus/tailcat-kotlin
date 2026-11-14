@@ -19,32 +19,54 @@ class MemoryDERPMapCache : DERPMapCache {
 }
 
 /** DERP map loading and expansion, with a one-hour cache and stale fallback. */
-class DERPMapProvider(
-    val url: String = defaultURL,
-    private val cache: DERPMapCache = MemoryDERPMapCache(),
+class DERPMapProvider internal constructor(
+    val url: String,
+    private val cache: DERPMapCache,
+    private val get: (url: String, etag: String?, mode: String, cancelled: () -> Boolean) -> HttpResponse,
 ) {
+    constructor(url: String = defaultURL, cache: DERPMapCache = MemoryDERPMapCache()) : this(url, cache, ::httpsGet)
+
     /** Failed fetches use the cached map, even when stale; without one they throw. */
-    fun regions(cancelled: () -> Boolean = { false }, forServer: Boolean = false): List<DERPRegion> {
+    fun regions(cancelled: () -> Boolean = { false }, forServer: Boolean = false): List<DERPRegion> = load(cancelled, forServer).first
+    /** The map, and whether it is the saved one rather than one fetched just now. */
+    private fun load(cancelled: () -> Boolean, forServer: Boolean): Pair<List<DERPRegion>, Boolean> {
         if (cancelled()) throw TailcatClosedException()
         val previous = cache.load()
         val now = io.tailcat.platform.wallClockMillis()
         if (previous != null && now >= previous.fetchedAtMillis && now - previous.fetchedAtMillis < 3_600_000) {
-            try { return parse(previous.json) } catch (_: Exception) { }
+            try { return parse(previous.json) to true } catch (_: Exception) { }
         }
         return try {
-            val response = httpsGet(url, previous?.etag, if (forServer) "server" else "client", cancelled)
-            val entry = if (response.status == 304 && previous != null) previous.copy(fetchedAtMillis = now)
-                else { require(response.status == 200); DERPMapCacheEntry(response.body.decodeToString(throwOnInvalidSequence = true), response.headers["etag"] ?: "", now) }
-            val parsed = parse(entry.json)
-            require(parsed.isNotEmpty())
-            cache.store(entry); parsed
+            fetch(previous, cancelled, forServer) to false
         } catch (failure: Exception) {
             if (cancelled()) throw TailcatClosedException()
-            previous?.let { try { parse(it.json) } catch (_: Exception) { null } } ?: throw failure
+            previous?.let { try { parse(it.json) to true } catch (_: Exception) { null } } ?: throw failure
         }
     }
-    fun expand(address: TailcatAddress, cancelled: () -> Boolean = { false }): List<DERPRegion> = if (address.regions.isNotEmpty()) address.regions
-        else regions(cancelled).let { map -> if (address.regionID == 0) map else map.filter { it.regionID == address.regionID } }
+    private fun fetch(previous: DERPMapCacheEntry?, cancelled: () -> Boolean, forServer: Boolean): List<DERPRegion> {
+        val now = io.tailcat.platform.wallClockMillis()
+        val response = get(url, previous?.etag, if (forServer) "server" else "client", cancelled)
+        val entry = if (response.status == 304 && previous != null) previous.copy(fetchedAtMillis = now)
+            else { require(response.status == 200); DERPMapCacheEntry(response.body.decodeToString(throwOnInvalidSequence = true), response.headers["etag"] ?: "", now) }
+        val parsed = parse(entry.json)
+        require(parsed.isNotEmpty())
+        cache.store(entry); return parsed
+    }
+    /** The map revalidated now, whatever its age; null if that failed. */
+    internal fun refresh(cancelled: () -> Boolean = { false }, forServer: Boolean = false): List<DERPRegion>? =
+        try { fetch(cache.load(), cancelled, forServer) } catch (_: Exception) { if (cancelled()) throw TailcatClosedException(); null }
+    fun expand(address: TailcatAddress, cancelled: () -> Boolean = { false }): List<DERPRegion> = expandSaved(address, cancelled).first
+    /**
+     * The address's regions, and whether they came from the saved map, which may be out of date. A region
+     * missing from the saved map is fetched before giving up.
+     */
+    internal fun expandSaved(address: TailcatAddress, cancelled: () -> Boolean = { false }): Pair<List<DERPRegion>, Boolean> {
+        if (address.regions.isNotEmpty()) return address.regions to false
+        fun pick(map: List<DERPRegion>) = if (address.regionID == 0) map else map.filter { it.regionID == address.regionID }
+        val (map, saved) = load(cancelled, false)
+        if (pick(map).isEmpty() && saved) refresh(cancelled)?.let { return pick(it) to false }
+        return pick(map) to saved
+    }
 
     /** Probe HTTPS latency for candidate regions; fall back to the first usable node. */
     fun select(regions: List<DERPRegion>, cancelled: () -> Boolean = { false }): DERPRegion {
@@ -97,7 +119,7 @@ class DERPMapProvider(
     }
 }
 
-private data class HttpResponse(val status: Int, val headers: Map<String, String>, val body: ByteArray)
+internal data class HttpResponse(val status: Int, val headers: Map<String, String>, val body: ByteArray)
 private fun httpsGet(url: String, etag: String?, mode: String, cancelled: () -> Boolean): HttpResponse {
     require(url.startsWith("https://")) { "DERP map URL requires HTTPS" }
     val remainder = url.substring(8)

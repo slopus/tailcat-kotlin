@@ -2,6 +2,7 @@ package io.tailcat
 
 import io.tailcat.crypto.NaClBox
 import io.tailcat.platform.secureRandom
+import io.tailcat.platform.wallClockMillis
 import io.tailcat.wireguard.WireGuard
 import java.net.InetAddress
 import java.net.ServerSocket
@@ -676,6 +677,52 @@ class RelayFirstSessionTest {
                     client.dialTCP(80, 10_000).let { try { exchange(it, "after the rejoin") } finally { it.close() } }
                 } finally { client.close() }
             }
+        }
+    }
+
+    /** A map with [relay]'s region on [port]. */
+    private fun map(relay: LocalRelay, port: Int): String {
+        val node = relay.region.nodes.single()
+        return """{"Regions":{"1":{"RegionID":1,"Nodes":[{"Name":"1a","RegionID":1,"HostName":"${node.hostName}","IPv4":"${node.ipv4}","STUNPort":-1,"DERPPort":$port}]}}}"""
+    }
+    private fun unusedPort(): Int = ServerSocket(0, 1, InetAddress.getByName("127.0.0.1")).use { it.localPort }
+    /** Connects with [saved] as the saved map and [current] served by its URL, counting the requests for it. */
+    private fun connectWithSavedMap(relay: LocalRelay, server: TailcatServer, saved: String, current: String, requests: AtomicInteger): TailcatClient {
+        val cache = MemoryDERPMapCache().apply { store(DERPMapCacheEntry(saved, "\"saved\"", wallClockMillis())) }
+        val provider = DERPMapProvider("https://map.test/derpmap.json", cache) { _, _, _, _ ->
+            requests.incrementAndGet(); HttpResponse(200, mapOf("etag" to "\"current\""), current.encodeToByteArray())
+        }
+        val address = server.address.let { TailcatAddress(it.serverPublicKey, it.serverDiscoPublicKey, it.presharedKey, emptyList(), 1) }
+        return TailcatClient.connect(address, ClientConfiguration(mapProvider = provider, connectTimeoutMillis = 10_000, testOnlyPlaintextDERP = true, relayFirst = true))
+    }
+
+    @Test fun aWrongRelayFromTheSavedMapIsRetriedWithTheCurrentOne() {
+        LocalRelay().use { relay ->
+            val server = TailcatServer(ServerConfiguration(region = relay.region, testOnlyPlaintextDERP = true, relayFirst = true, onTCP = { echo }))
+            server.start()
+            val requests = AtomicInteger()
+            try {
+                val started = System.nanoTime()
+                val client = connectWithSavedMap(relay, server, map(relay, unusedPort()), map(relay, relay.region.nodes.single().derpPort), requests)
+                try {
+                    val millis = (System.nanoTime() - started) / 1_000_000
+                    assertTrue(millis < 6000, "Retried with the current map 3 s in, not at the 10 s timeout: ${millis}ms")
+                    assertEquals(1, requests.get())
+                    client.dialTCP(80, 10_000).let { try { exchange(it, "over the current relay") } finally { it.close() } }
+                } finally { client.close() }
+            } finally { server.close() }
+        }
+    }
+
+    @Test fun anUnchangedMapKeepsTheFailedAttempt() {
+        LocalRelay().use { relay ->
+            val server = TailcatServer(ServerConfiguration(region = relay.region, testOnlyPlaintextDERP = true, relayFirst = true, onTCP = { echo }))
+            server.start()
+            val requests = AtomicInteger(); val wrong = map(relay, unusedPort())
+            try {
+                assertFailsWith<TailcatTimeoutException> { connectWithSavedMap(relay, server, wrong, wrong, requests).close() }
+                assertEquals(1, requests.get(), "Revalidated once")
+            } finally { server.close() }
         }
     }
 

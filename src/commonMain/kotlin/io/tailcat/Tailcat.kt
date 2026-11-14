@@ -124,26 +124,66 @@ class TailcatClient private constructor(private val engine: TailcatEngine) {
             val deadline = monotonicMillis() + configuration.connectTimeoutMillis
             val disco = address.serverDiscoPublicKey
             require(disco != null && disco.any { it != 0.toByte() }) { "Missing server discovery key" }
-            val regions = try {
+            val cancelled = { monotonicMillis() >= deadline }
+            val (regions, saved) = try {
                 trace?.mark("mapExpandStart")
-                configuration.mapProvider.expand(address) { monotonicMillis() >= deadline }
+                configuration.mapProvider.expandSaved(address, cancelled)
             } catch (failure: Exception) {
                 if (monotonicMillis() >= deadline) throw TailcatTimeoutException()
                 throw failure
             }
             require(regions.isNotEmpty()) { "No relay region" }
             trace?.mark("mapExpandDone")
-            val expanded = TailcatAddress(address.serverPublicKey, disco, address.presharedKey, regions, address.regionID)
-            val prepared = TailcatEngine(configuration.privateKey ?: NodePrivateKey.generate(), expanded, false,
-                ServerConfiguration(testOnlyPlaintextDERP = configuration.testOnlyPlaintextDERP, relayFirst = configuration.relayFirst), trace)
+            val key = configuration.privateKey ?: NodePrivateKey.generate()
+            fun attempt(regions: List<DERPRegion>) = Attempt(TailcatEngine(key, TailcatAddress(address.serverPublicKey, disco, address.presharedKey, regions, address.regionID), false,
+                ServerConfiguration(testOnlyPlaintextDERP = configuration.testOnlyPlaintextDERP, relayFirst = configuration.relayFirst), trace), deadline, trace)
+            val first = attempt(regions)
             trace?.mark("engineCreated")
-            try {
-                prepared.start((deadline-monotonicMillis()).coerceAtLeast(1))
-                prepared.awaitConnected((deadline-monotonicMillis()).coerceAtLeast(1))
-                trace?.mark("connectReturn")
-                return TailcatClient(prepared)
-            } catch (failure: Exception) { prepared.close(); if (monotonicMillis() >= deadline) throw TailcatTimeoutException(); throw failure }
+            if (!saved) return first.await()
+            // A saved map can be out of date. If its relay fails, or hasn't connected within three seconds,
+            // the map is revalidated; if the region changed, that attempt is dropped and one more is made
+            // with the current region.
+            first.within(minOf(deadline, monotonicMillis() + 3000))?.let { return it }
+            val region = regions[0]
+            val current = configuration.mapProvider.refresh(cancelled)?.firstOrNull { it.regionID == region.regionID }
+            if (current == null || current == region) return first.await()
+            first.cancel()?.let { return it }
+            trace?.mark("relayMapRefreshed")
+            return attempt(listOf(current)).await()
         }
+    }
+
+    /** One engine connecting on a thread of its own, so that a caller can give up on it for another. */
+    private class Attempt(private val engine: TailcatEngine, private val deadline: Long, private val trace: StartupTrace?) {
+        private val lock = PlatformLock(); private var done = false; private var failure: Exception? = null
+        init {
+            startThread("tailcat-connect") {
+                val error = try {
+                    engine.start((deadline-monotonicMillis()).coerceAtLeast(1))
+                    engine.awaitConnected((deadline-monotonicMillis()).coerceAtLeast(1)); null
+                } catch (error: Exception) { error }
+                lock.withLock { done = true; failure = error; lock.signalAll() }
+            }
+        }
+        /** The client if connected by [until]; null if not yet, or failed. */
+        fun within(until: Long): TailcatClient? = lock.withLock {
+            while (!done) { val left = until - monotonicMillis(); if (left <= 0) break; lock.await(left) }
+            if (done && failure == null) connected() else null
+        }
+        /** The client once connected; failed or past the deadline, the engine is closed and the failure thrown. */
+        fun await(): TailcatClient {
+            within(deadline)?.let { return it }
+            val error = lock.withLock { failure }
+            engine.close()
+            if (monotonicMillis() >= deadline || error == null) throw TailcatTimeoutException()
+            throw error
+        }
+        /** Closes the engine unless it connected meanwhile; then its client. */
+        fun cancel(): TailcatClient? {
+            lock.withLock { if (done && failure == null) return connected() }
+            engine.close(); return null
+        }
+        private fun connected(): TailcatClient { trace?.mark("connectReturn"); return TailcatClient(engine) }
     }
 }
 
