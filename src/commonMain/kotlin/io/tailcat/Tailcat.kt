@@ -377,7 +377,11 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
     private fun rejoin() {
         val peer = peers[address.serverPublicKey] ?: return
         if (server || !peer.acknowledged) return
-        peer.acknowledged = false; peer.rejoining = true; peer.lastMeow = -100_000; peer.lastHandshake = -100_000
+        // A server answers each packet on the old session until the new one is made. A rejoin already
+        // under way keeps its handshake's spacing: a second initiation within 20 ms is a flood to
+        // WireGuard, and the answer to the first would no longer match.
+        if (!peer.rejoining) peer.lastHandshake = -100_000
+        peer.acknowledged = false; peer.rejoining = true; peer.lastMeow = -100_000
         peer.sentSinceReceived = null; owedSince = null
     }
     private fun beginAdmission(key: NodePublicKey, peer: Peer) {

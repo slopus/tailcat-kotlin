@@ -40,6 +40,8 @@ class RelayFirstSessionTest {
         @Volatile var blockedDiscoverySource: NodePublicKey? = null
         /** WireGuard transport from this node goes nowhere; handshakes and meows still pass. */
         @Volatile var droppedTransportSource: NodePublicKey? = null
+        /** Packets this matches, by source, go nowhere. */
+        @Volatile var dropped: ((NodePublicKey, ByteArray) -> Boolean)? = null
         val region = DERPRegion(1, listOf(DERPNode("127.0.0.1", ipv4 = "127.0.0.1", derpPort = listener.localPort, stunPort = -1)))
         val connected: Int get() = sessions.size
         val openConnections: Int get() = sockets.size
@@ -82,6 +84,7 @@ class RelayFirstSessionTest {
                             packets.add(packet)
                             sourcedPackets.add(client to packet)
                             if (client == droppedTransportSource && WireGuard.packetType(packet) == 4) continue
+                            if (dropped?.invoke(client, packet) == true) continue
                             if (allowDiscovery && client != blockedDiscoverySource || !packet.startsWith(Discovery.magic)) {
                                 try { sessions[destination]?.takeUnless { it.silent }?.write(DerpFrame(5, client.raw + packet)) } catch (_: Exception) { }
                             }
@@ -639,6 +642,31 @@ class RelayFirstSessionTest {
                     client.resumeForTesting(20_000)
                     Thread.sleep(1000)
                     assertEquals(before, meows(relay, client), "No rejoin for the time away")
+                } finally { client.close() }
+            }
+        }
+    }
+
+    @Test fun aRejoinUnderWayKeepsItsHandshakeSpacingThroughAnotherMeowAgain() {
+        LocalRelay().use { relay ->
+            RestartableServer(relay, echo).use { restartable ->
+                val client = TailcatClient.connect(restartable.address, ClientConfiguration(testOnlyPlaintextDERP = true, relayFirst = true))
+                try {
+                    client.dialTCP(80).let { try { exchange(it, "before") } finally { it.close() } }
+                    val server = restartable.server.publicKey
+                    fun initiations() = relay.sourcedPackets.count { it.first == client.publicKey && WireGuard.packetType(it.second) == 1 }
+                    val before = initiations()
+                    // Hold the server's answer, so the rejoin is still under way when the next meow again comes.
+                    relay.dropped = { source, packet -> source == server && WireGuard.packetType(packet) == 2 }
+                    relay.inject(server, client.publicKey, meowAgain)
+                    eventually("The rejoin initiates") { initiations() > before }
+                    // The server answers each packet the client still sends on the old session.
+                    relay.inject(server, client.publicKey, meowAgain)
+                    Thread.sleep(500)
+                    assertEquals(before + 1, initiations(), "No second initiation inside the first one's second")
+                    relay.dropped = null
+                    eventually("The rejoin's next initiation completes") { initiations() > before + 1 }
+                    client.dialTCP(80, 10_000).let { try { exchange(it, "after the rejoin") } finally { it.close() } }
                 } finally { client.close() }
             }
         }
