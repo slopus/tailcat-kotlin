@@ -140,6 +140,35 @@ class RelayFirstTransportTest {
         } finally { f.close() }
     }
 
+    @Test fun aRelayResetMarkerReprobesAtOnceAndOnceMore() {
+        val f = Fixture()
+        try {
+            val udp = validated(f)
+            f.advance(); f.transport.recheck(); barrier(f) // A wake probes the route.
+            assertNotNull(pingTo(f, udp, f.endpoint))
+            udp.writes.clear()
+            // The peer's marker comes just after, and cancels that probe with the route.
+            f.transport.authenticatedRelayReset(f.remote.publicKey)
+            assertNotNull(pingTo(f, udp, f.endpoint), "Probed again at once, not after the one-second spacing")
+            udp.writes.clear()
+            f.advance(1000)
+            eventually("And once more after the spacing") { pingTo(f, udp, f.endpoint) != null }
+        } finally { f.close() }
+    }
+
+    @Test fun aSendThatFindsTheDirectRouteExpiredReprobesAtOnce() {
+        val f = Fixture()
+        try {
+            val udp = validated(f)
+            f.advance(31_000)
+            eventually("The maintenance probe") { pingTo(f, udp, f.endpoint) != null }
+            udp.writes.clear()
+            assertTrue(f.transport.trySend(f.remote.publicKey, ByteArray(148).also { it[0] = 1 }))
+            assertEquals(ConnectionPath.Relay, f.transport.path(f.remote.publicKey))
+            assertNotNull(pingTo(f, udp, f.endpoint), "The send that expired the route probes it again at once")
+        } finally { f.close() }
+    }
+
     @Test fun defaultsRemainOptIn() {
         assertFalse(ClientConfiguration().relayFirst)
         assertFalse(ServerConfiguration().relayFirst)

@@ -244,8 +244,21 @@ internal class NetworkTransport(
             peer.direct = null
             probes.entries.removeAll { it.value.peer == key }
             // Never mark an outgoing reset here: peer-induced fallback must not echo markers back.
-            requestProbe(key, listOfNotNull(selected))
+            // A probe just before the marker (a wake's) was cancelled with the route.
+            reprobe(key, peer, selected)
         }
+    }
+    /** A route just dropped: probe it now, without the spacing, and once more after it in case that one is lost too. */
+    private fun reprobe(key: NodePublicKey, peer: Peer, route: Endpoint?) {
+        peer.lastProbe = -100_000
+        requestProbe(key, listOfNotNull(route))
+        peer.probePending = true; peer.nextProbe = environment.now() + 1000
+    }
+    /** Under the lock. The probes that would renew it are what it waits on, so one goes again now. */
+    private fun expire(key: NodePublicKey, peer: Peer) {
+        val route = peer.direct ?: return
+        peer.direct = null; markReset(key, peer)
+        reprobe(key, peer, route)
     }
     private fun markReset(key: NodePublicKey, peer: Peer) {
         if (!peer.authenticated) return
@@ -256,9 +269,7 @@ internal class NetworkTransport(
     fun pendingResetMarker(key: NodePublicKey): Long? = lock.withLock {
         if (closed) return@withLock null
         val peer = peers[key] ?: return@withLock null
-        if (peer.direct != null && environment.now() - peer.verified >= 30_000) {
-            peer.direct = null; markReset(key, peer)
-        }
+        if (peer.direct != null && environment.now() - peer.verified >= 30_000) expire(key, peer)
         peer.resetMarker
     }
     /** The engine prepares crypto outside this lock. Generation tokens reject stale/closed completions. */
@@ -286,9 +297,7 @@ internal class NetworkTransport(
             if (closed) throw TailcatClosedException()
             val peer = peers[key]
             val transport = WireGuard.packetType(packet) == 4
-            if (peer != null && peer.direct != null && environment.now() - peer.verified >= 30_000) {
-                peer.direct = null; markReset(key, peer)
-            }
+            if (peer != null && peer.direct != null && environment.now() - peer.verified >= 30_000) expire(key, peer)
             if (transport && peer?.resetMarker != null) return false
             val endpoint = peer?.direct
             if (!packet.startsWith("meow".encodeToByteArray()) && endpoint != null && peer.directEnabled &&
