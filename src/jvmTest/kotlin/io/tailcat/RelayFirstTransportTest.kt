@@ -466,8 +466,11 @@ class RelayFirstTransportTest {
                 assertNull(pingTo(f, udp, fresh))
                 f.advance(1)
                 eventually("Fresh candidate request was dropped inside the limiter") { pingTo(f, udp, fresh) != null }
+                // Its Pong doesn't churn the healthy selected route, which its own Pong renewed.
                 f.pong(udp, checkNotNull(pingTo(f, udp, fresh)), fresh)
-                eventually { f.transport.path(f.remote.publicKey) == ConnectionPath.Direct(fresh.toString()) }
+                udp.reads.add(RawDatagram(f.endpoint, byteArrayOf(94)))
+                assertContentEquals(byteArrayOf(94), f.received.poll(1, TimeUnit.SECONDS))
+                assertEquals(ConnectionPath.Direct(f.endpoint.toString()), f.transport.path(f.remote.publicKey))
             } finally { f.close() }
         }
     }
@@ -488,8 +491,34 @@ class RelayFirstTransportTest {
             assertEquals(ConnectionPath.Direct(f.endpoint.toString()), f.transport.path(f.remote.publicKey))
             f.advance(900)
             eventually("New remote ports must precede stale candidate rounds") { pingTo(f, udp, fresh) != null }
-            f.pong(udp, checkNotNull(pingTo(f, udp, fresh)), fresh)
-            eventually { f.transport.path(f.remote.publicKey) == ConnectionPath.Direct(fresh.toString()) }
+        } finally { f.close() }
+    }
+
+    @Test fun aPongFromAnotherEndpointKeepsAHealthySelectedRoute() {
+        val f = Fixture()
+        try {
+            val udp = validated(f)
+            val other = f.endpoint.copy(port = 9300)
+            f.advance(100)
+            f.relay.incoming(DerpPacket(f.remote.publicKey, f.seal(DiscoveryMessage.CallMeMaybe(listOf(f.endpoint, other)))))
+            barrier(f)
+            f.advance(900)
+            eventually { pingTo(f, udp, other) != null }
+            // A reply from another endpoint the peer also invited: only the selected route's own Pong renews it.
+            f.pong(udp, checkNotNull(pingTo(f, udp, other)), other)
+            udp.reads.add(RawDatagram(f.endpoint, byteArrayOf(93)))
+            assertContentEquals(byteArrayOf(93), f.received.poll(1, TimeUnit.SECONDS))
+            assertEquals(ConnectionPath.Direct(f.endpoint.toString()), f.transport.path(f.remote.publicKey))
+            // Withdrawn from the invitation, the selected route gives way to an invited one that answers.
+            f.advance(100)
+            f.relay.incoming(DerpPacket(f.remote.publicKey, f.seal(DiscoveryMessage.CallMeMaybe(listOf(other)))))
+            barrier(f)
+            f.advance(1000)
+            eventually { udp.writes.count { it.first == other } >= 2 }
+            val ping = udp.writes.filter { it.first == other && Discovery.sourceKey(it.second) != null }
+                .map { Discovery.open(it.second, f.remote.discoPrivateKey).second }.filterIsInstance<DiscoveryMessage.Ping>().last()
+            f.pong(udp, ping, other)
+            eventually { f.transport.path(f.remote.publicKey) == ConnectionPath.Direct(other.toString()) }
         } finally { f.close() }
     }
 

@@ -430,8 +430,14 @@ internal class NetworkTransport(
                     val pending = probes[transaction] ?: return
                     if (endpoint == null || pending.peer != key || pending.endpoint != endpoint || now - pending.sent > 10_000) return
                     probes.remove(transaction)
-                    bind(peer, endpoint, now); peer.direct = endpoint; peer.verified = now
-                    trace?.markOnce("directValidated")
+                    bind(peer, endpoint, now)
+                    // A late reply from another endpoint must not churn a healthy selected route: only its own
+                    // Pong renews it. One the peer invited replaces one it no longer invites.
+                    val direct = peer.direct; val invited = peer.advertisedEndpoints.orEmpty()
+                    if (direct == null || direct == endpoint || now - peer.verified >= 30_000 || (endpoint in invited && direct !in invited)) {
+                        peer.direct = endpoint; peer.verified = now
+                        trace?.markOnce("directValidated")
+                    }
                     peer.probeInterval = 1000
                     // A late Pong from an old round must not postpone a fresh-candidate request.
                     peer.nextProbe = if (peer.probePending) minOf(peer.nextProbe, peer.lastProbe + 1000) else now + 10_000
