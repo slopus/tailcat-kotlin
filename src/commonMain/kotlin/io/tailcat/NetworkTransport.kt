@@ -18,6 +18,8 @@ internal class NetworkTransport(
     private val trace: StartupTrace? = null,
     /** A peer's authenticated invitation moved every advertised port: a new socket, as when it restarted. */
     private val restarted: (NodePublicKey) -> Unit = {},
+    /** The relay connection is up again after a failure: what went out the old one is owed again. */
+    relayRecovered: () -> Unit = {},
     private val incoming: (NodePublicKey, ByteArray, Boolean) -> Unit,
 ) {
     private class Peer(val disco: ByteArray, var directEnabled: Boolean) {
@@ -73,7 +75,7 @@ internal class NetworkTransport(
     private val nodePublic = identity.publicKey.raw
     private var probeBudget = 32
     private var probeBudgetAt = environment.now()
-    private val relay = (relayFactory ?: { callback -> DerpTransport(nodes, identity, testOnlyPlaintextDERP, trace, callback) }) {
+    private val relay = (relayFactory ?: { callback -> DerpTransport(nodes, identity, testOnlyPlaintextDERP, trace, relayRecovered, callback) }) {
         offer(Event(it.source, null, it.payload))
     }
 

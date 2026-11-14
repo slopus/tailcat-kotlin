@@ -165,6 +165,7 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
         class Outgoing(val packet: ByteArray) : Event()
         class Admitted(val key: NodePublicKey, val token: Long, val allowed: Boolean) : Event()
         class Restarted(val key: NodePublicKey) : Event()
+        object RelayRecovered : Event()
     }
     private data class ServiceKey(val destination: BytesKey, val port: Int, val udp: Boolean)
     private data class FlowKey(val destination: BytesKey, val source: BytesKey, val localPort: Int, val remotePort: Int)
@@ -191,7 +192,8 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
     /** When a tick first found a flow retransmitting, unanswered since. */
     private var owedSince: Long? = null
     private val network = NetworkTransport(identity, address.regions.first().nodes, configuration.testOnlyPlaintextDERP,
-        relayFirst = configuration.relayFirst, trace = trace, restarted = { key -> try { offer(Event.Restarted(key)) } catch (_: Exception) { } }) {
+        relayFirst = configuration.relayFirst, trace = trace, restarted = { key -> try { offer(Event.Restarted(key)) } catch (_: Exception) { } },
+        relayRecovered = { try { offer(Event.RelayRecovered) } catch (_: Exception) { } }) {
         key, packet, relay -> offer(Event.Incoming(key, packet, relay))
     }
     private val stack = newStack(publicKey.address)
@@ -224,7 +226,9 @@ internal class TailcatEngine(private val identity: NodePrivateKey, val address: 
                     when (event) { is Event.Incoming -> receive(event); is Event.Outgoing -> sendIP(event.packet); is Event.Admitted -> completeAdmission(event)
                         // A server back on new ports holds neither our session nor our admission: nothing sent
                         // on the old session can be answered, so rejoin now rather than wait for its silence.
-                        is Event.Restarted -> if (event.key == address.serverPublicKey) rejoin() }
+                        is Event.Restarted -> if (event.key == address.serverPublicKey) rejoin()
+                        // Each flow's lost segments would otherwise wait out a timer that backed off while there was no way.
+                        Event.RelayRecovered -> stack.resendOwed() }
                 } catch (_: Exception) { }
                 tick(monotonicMillis())
             }

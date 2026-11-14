@@ -415,7 +415,7 @@ class RelayFirstSessionTest {
                     eventually("The silent relay is replaced") { relay.connections.get() > connections }
                     val millis = (System.nanoTime() - woke) / 1_000_000
                     println("SILENT-RELAY-RECOVERY ${millis}ms")
-                    assertTrue(millis in 1900..3000, "Replaced at the two-second deadline, not the 120-second one: ${millis}ms")
+                    assertTrue(millis in 1400..2500, "Replaced at the 1.5 s deadline before a round trip is measured, not the 120-second one: ${millis}ms")
                     exchange(connection, "same stream once the silent relay is replaced")
                     assertEquals(1, relay.packets.count { WireGuard.packetType(it) == 1 }, "The session is kept")
                 } finally { connection.close() }
@@ -667,6 +667,50 @@ class RelayFirstSessionTest {
                     relay.dropped = null
                     eventually("The rejoin's next initiation completes") { initiations() > before + 1 }
                     client.dialTCP(80, 10_000).let { try { exchange(it, "after the rejoin") } finally { it.close() } }
+                } finally { client.close() }
+            }
+        }
+    }
+
+    @Test fun aCheckWaitsThreeOfTheRelaysRoundTripsAtLeastASecond() {
+        LocalRelay().use { relay ->
+            RestartableServer(relay, echo).use { restartable ->
+                val client = TailcatClient.connect(restartable.address, ClientConfiguration(testOnlyPlaintextDERP = true, relayFirst = true))
+                try {
+                    // A check on a live relay measures its round trip, a millisecond here.
+                    client.wake(); Thread.sleep(500)
+                    val connections = relay.connections.get()
+                    relay.silence(client.publicKey)
+                    val woke = System.nanoTime()
+                    client.wake()
+                    eventually("The silent relay is replaced") { relay.connections.get() > connections }
+                    val millis = (System.nanoTime() - woke) / 1_000_000
+                    println("MEASURED-CHECK ${millis}ms")
+                    assertTrue(millis in 900..1400, "Replaced after a second: ${millis}ms")
+                } finally { client.close() }
+            }
+        }
+    }
+
+    @Test fun aRelayReplacedAfterAFailureGetsWhatEachFlowOwesAtOnce() {
+        LocalRelay().use { relay ->
+            RestartableServer(relay, echo).use { restartable ->
+                val client = TailcatClient.connect(restartable.address, ClientConfiguration(testOnlyPlaintextDERP = true, relayFirst = true))
+                try {
+                    val connection = client.dialTCP(80)
+                    exchange(connection, "before the relay goes silent")
+                    // A move nobody is told of: the relay connection goes dead with nothing said.
+                    relay.silence(client.publicKey)
+                    val began = System.nanoTime()
+                    val done = java.util.concurrent.atomic.AtomicReference<Throwable?>(null)
+                    val owed = thread(isDaemon = true) { try { exchange(connection, "sent into the dead relay") } catch (failure: Throwable) { done.set(failure) } }
+                    // Its segment backs off: 0.5, 1.5 and 3.5 s, then not until 7.5 s.
+                    Thread.sleep(4000)
+                    client.wake()
+                    owed.join(10_000); done.get()?.let { throw it }
+                    val millis = (System.nanoTime() - began) / 1_000_000
+                    println("RELAY-RECOVERY-RESEND ${millis}ms")
+                    assertTrue(millis < 6500, "Resent when the relay was replaced at about 5.5 s, not at 7.5 s: ${millis}ms")
                 } finally { client.close() }
             }
         }

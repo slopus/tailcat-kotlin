@@ -17,6 +17,11 @@ internal class DerpTransport(
     private val privateKey: NodePrivateKey,
     private val testOnlyPlaintext: Boolean = false,
     private val trace: StartupTrace? = null,
+    /**
+     * Each time the connection is up again after one failed or was found silent by a check; not on
+     * the first connect. What went out the old connection meanwhile was lost, and is owed again.
+     */
+    private val recovered: () -> Unit = {},
     private val incoming: (DerpPacket) -> Unit,
 ) : NetworkRelay {
     private val nodes = nodes.filter { !it.stunOnly }
@@ -46,6 +51,10 @@ internal class DerpTransport(
     private var lastTick = 0L
     // A failed advertised fast-start capability falls back on the next fresh connection only.
     private var fastStartAllowed = true
+    private var recovering = false
+    /** The relay's round trip, smoothed (RFC 6298's 1/8), from our pings to their pongs. */
+    private var smoothedRTT: Long? = null
+    private val pings = mutableMapOf<BytesKey, Long>()
 
     override val connectionGeneration: Long? get() = lock.withLock { if (ready && !closed) generation else null }
 
@@ -106,25 +115,32 @@ internal class DerpTransport(
                 // Ticks stopped: the process was frozen. The time away is no one's silence; a check decides.
                 val away = now - lastTick
                 phaseStarted += away; lastReceived = minOf(lastReceived + away, now - 1); lastPing = now
-                if (ready) {
-                    checkSince = now; checkBy = now + 2_000
-                    if (queue.size < 256) { queue.addLast(DerpFrame(0x12, secureRandom(8))); lock.signalAll() }
-                }
+                if (ready) { checkSince = now; checkBy = now + checkDeadline(2_000); ping(now) }
             }
             lastTick = now
             if ((!ready && now - phaseStarted > 25_000) || (ready && now - lastReceived > 120_000)) close = stream
             if (checkBy != 0L && now >= checkBy) {
                 // A silent stream is replaced at once, without the failure backoff.
-                if (ready && lastReceived < checkSince) { close = stream; reconnectRequested = true }
+                if (ready && lastReceived < checkSince) { close = stream; reconnectRequested = true; recovering = true }
                 checkBy = 0
             }
-            if (ready && now - lastPing >= 30_000) {
-                lastPing = now
-                if (queue.size < 256) { queue.addLast(DerpFrame(0x12, secureRandom(8))); lock.signalAll() }
-            }
+            if (ready && now - lastPing >= 30_000) { lastPing = now; ping(now) }
         }
         close?.close()
     }
+    /** Under the lock. */
+    private fun ping(now: Long) {
+        if (queue.size >= 256) return
+        val payload = secureRandom(8)
+        if (pings.size >= 8) pings.clear()
+        pings[BytesKey(payload)] = now
+        queue.addLast(DerpFrame(0x12, payload)); lock.signalAll()
+    }
+    /**
+     * Three of the relay's round trips, at least a second, or before one is measured [requested],
+     * at most 1.5 s. Anything heard counts, so a busy connection whose pong queues behind its traffic stays.
+     */
+    private fun checkDeadline(requested: Long): Long = smoothedRTT?.let { maxOf(1000, 3 * it) } ?: minOf(requested, 1500)
     override fun check(deadlineMillis: Long) = lock.withLock {
         if (closed) return@withLock
         if (!ready) {
@@ -133,13 +149,13 @@ internal class DerpTransport(
             return@withLock
         }
         val now = monotonicMillis()
-        checkSince = now; checkBy = now + deadlineMillis
-        if (queue.size < 256) { queue.addLast(DerpFrame(0x12, secureRandom(8))); lock.signalAll() }
+        checkSince = now; checkBy = now + checkDeadline(deadlineMillis)
+        ping(now)
     }
     override fun reconnect() {
         val old = lock.withLock {
             if (closed) return
-            generation++; ready = false; reconnectRequested = true; lock.signalAll()
+            generation++; ready = false; reconnectRequested = true; recovering = true; lock.signalAll()
             stream.also { stream = null }
         }
         old?.close()
@@ -172,11 +188,13 @@ internal class DerpTransport(
                 val node = nodes[nodeIndex]
                 trace?.mark("derpAttempt", id)
                 establish(connection, node)
-                lock.withLock {
+                val recovery = lock.withLock {
                     if (closed || stream !== connection) throw TailcatClosedException()
                     ready = true; lastReceived = monotonicMillis(); lastPing = lastReceived; lock.signalAll()
                     trace?.mark("derpReady", id)
+                    recovering.also { recovering = false }
                 }
+                if (recovery) recovered()
                 delay = 250
                 while (true) {
                     val frame = readFrame(connection)
@@ -191,7 +209,15 @@ internal class DerpTransport(
                         }
                         6 -> require(frame.payload.isEmpty())
                         0x12 -> { require(frame.payload.size == 8); enqueue(DerpFrame(0x13, frame.payload)) }
-                        0x13 -> require(frame.payload.size == 8)
+                        0x13 -> {
+                            require(frame.payload.size == 8)
+                            lock.withLock {
+                                pings.remove(BytesKey(frame.payload))?.let { sent ->
+                                    val sample = monotonicMillis() - sent
+                                    smoothedRTT = smoothedRTT?.let { (7 * it + sample) / 8 } ?: sample
+                                }
+                            }
+                        }
                         8 -> require(frame.payload.size >= 32)
                         0x15 -> {
                             require(frame.payload.size == 8)
@@ -205,6 +231,7 @@ internal class DerpTransport(
                 lock.withLock {
                     if (stream === connection) { ready = false; stream = null; lock.signalAll() }
                     if (closed) return
+                    recovering = true; pings.clear()
                     nodeIndex = (nodeIndex + 1) % nodes.size
                 }
                 delay = (if (delay == 0L) 250 else delay * 2).coerceAtMost(30_000)
